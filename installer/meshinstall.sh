@@ -153,4 +153,14 @@ WLP
     fi
 fi
 echo "MeshAgent installed for group '$MESH_NAME' ($(uname -m))."
+
+# ---- warn if FileVault is on: login-window KVM can't work across reboots ----
+if /usr/bin/fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+    echo
+    echo "WARNING: FileVault is ENABLED. After a reboot this Mac stops at the pre-boot"
+    echo "  disk-unlock screen (before macOS and this agent run), so remote login-window"
+    echo "  video/input will NOT be available until someone unlocks it physically."
+    echo "  For unattended remote access at the login window, disable FileVault:"
+    echo "      sudo fdesetup disable"
+fi
 exit 0

@@ -14,6 +14,17 @@ It also ships a friction-free installer (a `curl | bash` one-liner and a double-
 `.command`), because MeshCentral's built-in macOS download is a **legacy `.mpkg` that
 modern macOS refuses to install**.
 
+> ### ⚠️ Requirement: FileVault must be **disabled**
+> "Login window" here means the normal macOS login window, which appears **after** macOS has
+> booted and the agent is running. With **FileVault** enabled, a reboot instead stops at the
+> **pre-boot disk-unlock screen** — that runs in the EFI/recoveryOS environment *before*
+> macOS, launchd, `screensharingd`, or the MeshAgent exist, so there is nothing to capture or
+> inject and no way to unlock the disk remotely. (FileVault also passes that unlock straight
+> through to the user session, so the normal login window is usually skipped entirely.)
+> **For remote access at/through the login window to work after a reboot, disable FileVault**
+> (`sudo fdesetup disable`). This is a hard macOS limitation, not something the agent can work
+> around. See [docs/architecture.md](docs/architecture.md#limitations).
+
 ---
 
 ## TL;DR — install on a Mac

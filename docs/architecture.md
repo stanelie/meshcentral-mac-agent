@@ -111,6 +111,36 @@ MDM-managed fleets the equivalent is a **PPPC configuration profile** pre-approv
   makes no difference; a full TigerVNC-style client is ignored identically when the helper
   is ungranted.
 
+## Limitations
+
+### FileVault must be disabled
+The "login window" this project controls is the **normal macOS login window** — the one drawn
+by `loginwindow` after macOS has booted, launchd has started the LaunchAgents, and the kvmagent
++ screensharingd are running.
+
+With **FileVault** enabled, a cold boot or reboot does not reach that state. It first stops at
+the **pre-boot authentication (disk-unlock) screen**, which runs in the EFI / recoveryOS
+environment **before** the macOS kernel, launchd, `screensharingd`, or the MeshAgent exist.
+Nothing is running there, so:
+
+- there is no framebuffer source and no event-dispatch process to drive — **no remote video or
+  input at the unlock screen**, and no way to unlock the disk remotely; and
+- once someone unlocks the disk **physically**, FileVault forwards that authentication straight
+  into the user's session (pre-boot auth → auto-login), so the normal login window is typically
+  **skipped entirely** — the moment this project targets never appears.
+
+This is a fundamental property of FileVault, not something the agent can bypass (bypassing
+pre-boot disk encryption is exactly what FileVault exists to prevent). **For unattended
+remote access at/through the login window across reboots, disable FileVault:**
+
+```bash
+sudo fdesetup disable
+```
+
+If FileVault is required by policy, remote login-window control is not achievable on that
+machine after a reboot; you would only regain remote access once a user has physically unlocked
+and logged in.
+
 ## Onboarding: served-binary hash match
 
 MeshCentral withholds the agent **core** (Desktop/Terminal/Files tabs) until the connecting
