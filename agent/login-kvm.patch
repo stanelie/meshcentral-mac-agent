@@ -13,10 +13,10 @@ index fb8c1c5..d0ea32c 100644
  	$(STRIP)
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..d34634d 100644
+index c27e1f0..580ed94 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,908 @@
+@@ -2,13 +2,906 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -347,11 +347,20 @@ index c27e1f0..d34634d 100644
 +
 +static IOHIDUserDeviceRef make_hid_device(CFDictionaryRef props)
 +{
-+    IOHIDUserDeviceRef dev = IOHIDUserDeviceCreateWithProperties(kCFAllocatorDefault, props, 0);
-+    if (!dev) return NULL;
-+    IOHIDUserDeviceSetDispatchQueue(dev, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
-+    IOHIDUserDeviceActivate(dev);
-+    return dev;
++    // IOHIDUserDevice needs the restricted com.apple.hid.manager.user-device
++    // entitlement, which ad-hoc-signed binaries cannot carry. We never actually
++    // use this virtual-HID path — login-window input goes through screensharingd
++    // VNC and in-session input through CGEventPost — so it is skipped here.
++    //
++    // Skipping it also fixes a hard crash on macOS 11 (Big Sur): there the kernel
++    // denies the create ("IOHIDResourceDeviceUserClient ... not entitled",
++    // IOServiceOpen 0xe00002c2) but IOHIDUserDeviceCreateWithProperties still
++    // returns a NON-NULL, invalid ref, and IOHIDUserDeviceActivate() on it
++    // crashes the process right after kvm_init — before the capture loop — so the
++    // agent restart-loops and the remote screen is permanently black. (On macOS
++    // 14+ the create returned NULL and this was already a no-op.)
++    (void)props;
++    return NULL;
 +}
 +
 +// Standard boot-protocol keyboard report descriptor
@@ -893,32 +902,21 @@ index c27e1f0..d34634d 100644
 +    }
 +    if (g_kbd_dev && g_mouse_dev) return;  // IOHIDUserDevice succeeded — best path
 +
-+    // ---- Priority 2: steal the bridge daemon's existing io_connect_t ----
-+    // NOTE: On Parallels guests, AppleVirtualPlatformHIDBridge routes events to the host,
-+    // not into the local HID stack — keyboard injection will not reach loginwindow here.
-+    // On a physical Mac or native Apple VM host, this path injects into the guest VM.
-+    g_avp_kbd_conn = steal_avp_kbd_from_bridge();
-+    {
-+        char b[80]; int l = snprintf(b, sizeof(b), "hid_inject_init: avp_steal=%s\n",
-+            g_avp_kbd_conn != IO_OBJECT_NULL ? "OK" : "NULL");
-+        write(STDOUT_FILENO, b, l);
-+    }
-+    if (g_avp_kbd_conn != IO_OBJECT_NULL) return;
++    // Priority 2 / 2b (AppleVirtualPlatform HID bridge) are intentionally DISABLED.
++    // They are never the working injection path on our targets: login-window input
++    // goes through screensharingd VNC and in-session input through CGEventPost, and
++    // on a Parallels/Apple VM guest the bridge routes events to the host rather than
++    // the guest login window. More importantly, on macOS 11 (Big Sur)
++    // steal_avp_kbd_from_bridge()/open_avp_hid_interface() crash the process (IOKit)
++    // — like the IOHIDUserDevice path above — killing the agent right after kvm_init,
++    // before the capture loop, so the remote screen stays black. Skipping them leaves
++    // g_avp_kbd_conn/g_kbd_dev NULL, which is exactly what the injection code already
++    // expects when it falls through to CGEventPost (KeyAction) or vnc_inject (login).
++    (void)&steal_avp_kbd_from_bridge; (void)&open_avp_hid_interface;
 +
-+    // ---- Priority 2b: direct IOServiceOpen ----
-+    g_avp_kbd_conn = open_avp_hid_interface(0);
-+    {
-+        char b[80]; int l = snprintf(b, sizeof(b), "hid_inject_init: avp_direct=%s\n",
-+            g_avp_kbd_conn != IO_OBJECT_NULL ? "OK" : "NULL");
-+        write(STDOUT_FILENO, b, l);
-+    }
-+    if (g_avp_kbd_conn != IO_OBJECT_NULL) return;
-+
-+    if (!g_kbd_dev) {
-+        // Fall back to CGEvent path
-+        dispatch_once_f(&g_postOnce, NULL, post_init_once);
-+        write(STDOUT_FILENO, "hid_inject_init: falling back to CGEvent\n", 41);
-+    }
++    // Fall back to the CGEvent path (in-session). Login window uses vnc_inject.
++    dispatch_once_f(&g_postOnce, NULL, post_init_once);
++    write(STDOUT_FILENO, "hid_inject_init: using CGEvent path\n", 35);
 +}
 +
 +static const int g_keymapLen = 114;
@@ -928,7 +926,7 @@ index c27e1f0..d34634d 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1027,225 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1025,225 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
@@ -1298,3 +1296,457 @@ index c27e1f0..d34634d 100644
 +    post_cgevent(e);
 +    CFRelease(e);
  }
+diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
+index 6d57690..62880c3 100644
+--- a/meshcore/KVM/MacOS/mac_kvm.c
++++ b/meshcore/KVM/MacOS/mac_kvm.c
+@@ -15,6 +15,7 @@ limitations under the License.
+ */
+ 
+ #include "mac_kvm.h"
++#include "mac_events.h"
+ #include "../../meshdefines.h"
+ #include "../../meshinfo.h"
+ #include "../../../microstack/ILibParsers.h"
+@@ -34,6 +35,16 @@ limitations under the License.
+ 
+ #include <string.h>
+ #include <pwd.h>
++#include <dlfcn.h>
++
++// Temporary diagnostic log for loginwindow KVM debugging
++static void kvm_flog(const char *fmt, ...) {
++    FILE *f = fopen("/tmp/kvm_debug.log", "a");
++    if (!f) return;
++    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
++    fflush(f); fclose(f);
++}
++#include <stdarg.h>
+ 
+ int KVM_Listener_FD = -1;
+ // Socket path used when kvm_server_mainloop runs in socket-listener
+@@ -289,8 +300,22 @@ int kvm_init()
+ {
+ 	ILibCriticalLogFilename = "KVMSlave.log";
+ 	int old_height_count = TILE_HEIGHT_COUNT;
+-	
++
+ 	SCREEN_NUM = CGMainDisplayID();
++	if (__builtin_available(macOS 10.15, *))
++	{
++		// Check (but do NOT request) TCC screen capture access.
++		// CGRequestScreenCaptureAccess() triggers a recurring permission banner
++		// even when auth_value=2 is already in TCC.db; CGDisplayCreateImage works
++		// via the path-based TCC entry without needing the request call.
++		bool pre = CGPreflightScreenCaptureAccess();
++		kvm_flog("kvm_init: CGMainDisplayID=%u preflight=%d uid=%d\n",
++			SCREEN_NUM, (int)pre, (int)getuid());
++	}
++	else
++	{
++		kvm_flog("kvm_init: CGMainDisplayID=%u uid=%d\n", SCREEN_NUM, (int)getuid());
++	}
+ 	
+ 	if (SCREEN_WIDTH > 0)
+ 	{
+@@ -299,8 +324,23 @@ int kvm_init()
+ 		CGDisplayModeRelease(mode);
+ 	}
+ 
++	kvm_flog("kvm_init: CGDisplayIsActive=%d CGDisplayIsOnline=%d\n",
++		(int)CGDisplayIsActive(SCREEN_NUM), (int)CGDisplayIsOnline(SCREEN_NUM));
++	// One-time diagnostic: test if screencapture can capture from this context.
++	{
++		static int sc_tested = 0;
++		if (!sc_tested) {
++			sc_tested = 1;
++			unlink("/tmp/kvm_sc_test.png");
++			int ret = system("/usr/sbin/screencapture -x /tmp/kvm_sc_test.png 2>/dev/null");
++			struct stat st; int exists = (stat("/tmp/kvm_sc_test.png", &st) == 0);
++			kvm_flog("screencapture test: ret=%d file_exists=%d size=%lld\n",
++				ret, exists, (long long)(exists ? st.st_size : 0));
++		}
++	}
+ 	SCREEN_HEIGHT = CGDisplayPixelsHigh(SCREEN_NUM) * SCREEN_SCALE;
+ 	SCREEN_WIDTH = CGDisplayPixelsWide(SCREEN_NUM) * SCREEN_SCALE;
++	kvm_flog("kvm_init: SCREEN_WIDTH=%d SCREEN_HEIGHT=%d SCREEN_SCALE=%d\n", SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_SCALE);
+ 	// Some magic numbers.
+ 	TILE_WIDTH = 32;
+ 	TILE_HEIGHT = 32;
+@@ -312,13 +352,20 @@ int kvm_init()
+ 	if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
+ 	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
+ 	
++	kvm_flog("kvm_init: calling kvm_send_resolution\n");
+ 	kvm_send_resolution();
++	kvm_flog("kvm_init: calling reset_tile_info\n");
+ 	reset_tile_info(old_height_count);
+-	
++	kvm_flog("kvm_init: building keystate\n");
++
+ 	unsigned char *buffer = ILibMemory_SmartAllocate(5);
+ 	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_KEYSTATE);		// Write the type
+ 	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
+-	buffer[4] = (unsigned char)get_kbd_state();
++	// Skip get_kbd_state() IOKit call here — IOServiceOpen(kIOHIDParamConnectType) can
++	// deadlock when the kvm_mainloopinput thread is concurrently posting CGEvents via
++	// kCGHIDEventTap (both contend on the IOHIDSystem kernel mutex). The client will
++	// receive the correct state on the next lock-key press anyway.
++	buffer[4] = 0;
+ 
+ 	// Write the reply to the pipe.
+ 	ILibQueue_Lock(g_messageQ);
+@@ -341,6 +388,12 @@ int kvm_server_inputdata(char* block, int blocklen)
+ 	type = ntohs(((unsigned short*)(block))[0]);
+ 	size = ntohs(((unsigned short*)(block))[1]);
+ 
++	{
++		char _dbuf[64];
++		int _dlen = snprintf(_dbuf, sizeof(_dbuf), "inputdata: type=%d size=%d blocklen=%d\n", type, size, blocklen);
++		write(STDOUT_FILENO, _dbuf, _dlen);
++	}
++
+ 	if (size > blocklen) return 0;
+ 
+ 	switch (type)
+@@ -484,7 +537,7 @@ void* kvm_mainloopinput(void* param)
+ 	int ptr = 0;
+ 	int ptr2 = 0;
+ 	int len = 0;
+-	char* pchRequest2[30000];
++	char pchRequest2[30000];
+ 	int cbBytesRead = 0;
+ 
+ 	char tmp[255];
+@@ -539,7 +592,7 @@ void* kvm_mainloopinput(void* param)
+ 			write(STDOUT_FILENO, tmp, tmpLen);
+ 			fsync(STDOUT_FILENO);
+ 		}
+-		while ((ptr2 = kvm_server_inputdata((char*)pchRequest2 + ptr, cbBytesRead - ptr)) != 0) { ptr += ptr2; }
++		while ((ptr2 = kvm_server_inputdata(pchRequest2 + ptr, len - ptr)) != 0) { ptr += ptr2; }
+ 
+ 		if (KVM_AGENT_FD != -1)
+ 		{
+@@ -549,7 +602,7 @@ void* kvm_mainloopinput(void* param)
+ 		}
+ 
+ 		if (ptr == len) { len = 0; ptr = 0; }
+-		// TODO: else move the reminder.
++		else { memmove(pchRequest2, pchRequest2 + ptr, len - ptr); len -= ptr; ptr = 0; }
+ 	}
+ 
+ 	return 0;
+@@ -557,16 +610,11 @@ void* kvm_mainloopinput(void* param)
+ void ExitSink(int s)
+ {
+ 	UNREFERENCED_PARAMETER(s);
+-
+-	signal(SIGTERM, SIG_IGN);	
+-	
+-	if (KVM_Listener_FD > 0) 
+-	{
+-		write(STDOUT_FILENO, "EXITING\n", 8);
+-		fsync(STDOUT_FILENO);
+-		close(KVM_Listener_FD); 
+-	}
+-	g_shutdown = 1;
++	// _exit(1): exit immediately with non-zero so launchd (KeepAlive:true /
++	// SuccessfulExit:false) restarts us. Closing KVM_Listener_FD and waiting
++	// for the kvm_mainloopinput thread (which may block in read(KVM_AGENT_FD))
++	// can hang indefinitely; _exit bypasses that.
++	_exit(1);
+ }
+ void* kvm_server_mainloop(void* param)
+ {
+@@ -637,6 +685,7 @@ void* kvm_server_mainloop(void* param)
+ 		{
+ 			written = write(STDOUT_FILENO, "ACCEPT ERROR ON DOMAIN SOCKET", 29);
+ 			fsync(STDOUT_FILENO);
++			kvm_flog("ACCEPT ERROR: errno=%d\n", errno);
+ 			return(NULL);
+ 		}
+ 		else
+@@ -645,12 +694,15 @@ void* kvm_server_mainloop(void* param)
+ 			int tmpLen = sprintf_s(tmp, sizeof(tmp), "ACCEPTed new connection %d on Domain Socket\n", KVM_AGENT_FD);
+ 			written = write(STDOUT_FILENO, tmp, tmpLen);
+ 			fsync(STDOUT_FILENO);
+-
++			kvm_flog("ACCEPTED connection fd=%d uid=%d\n", KVM_AGENT_FD, (int)getuid());
+ 		}
+ 	}
+ 	// Init the kvm
+ 	g_messageQ = ILibQueue_Create();
+-	if (kvm_init() != 0) { return (void*)-1; }
++	kvm_flog("kvm_init start\n");
++	if (kvm_init() != 0) { kvm_flog("kvm_init FAILED\n"); return (void*)-1; }
++	kvm_flog("kvm_init OK\n");
++	hid_inject_init();
+ 
+ 
+ 	g_shutdown = 0;
+@@ -724,9 +776,11 @@ void* kvm_server_mainloop(void* param)
+ 		}
+ 
+ 		screen_num = CGMainDisplayID();
++		static int logged_once = 0;
++		if (!logged_once) { kvm_flog("MainLoop start: CGMainDisplayID=%u\n", screen_num); logged_once = 1; }
++
++		if (screen_num == 0) { kvm_flog("CGMainDisplayID=0, shutdown\n"); g_shutdown = 1; senddebug(-2); break; }
+ 
+-		if (screen_num == 0) { g_shutdown = 1; senddebug(-2); break; }
+-		
+ 		if (SCREEN_SCALE_SET == 0)
+ 		{
+ 			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
+@@ -741,19 +795,136 @@ void* kvm_server_mainloop(void* param)
+ 		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
+ 		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
+ 		
+-		if ((SCREEN_HEIGHT != screen_height || (SCREEN_WIDTH != screen_width) || SCREEN_NUM != screen_num)) 
++		if ((SCREEN_HEIGHT != screen_height || (SCREEN_WIDTH != screen_width) || SCREEN_NUM != screen_num))
+ 		{
++			kvm_flog("reinit: H=%d→%d W=%d→%d SCALE=%d NUM=%u→%u\n",
++				SCREEN_HEIGHT, screen_height, SCREEN_WIDTH, screen_width,
++				SCREEN_SCALE, SCREEN_NUM, screen_num);
+ 			kvm_init();
+ 			continue;
+ 		}
+ 
+ 		//senddebug(screen_num);
+-		CGImageRef image = CGDisplayCreateImage(screen_num);
+-		//senddebug(99);
+-		if (image == NULL) 
++		extern CGImageRef kvm_capture_sck(uint32_t displayID);
++		CGImageRef image = NULL;
++		if (getuid() == 0)
++		{
++			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
++			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
++			// back to the standard CoreGraphics capture APIs: on a PHYSICAL Mac (not
++			// a headless VM) these DO capture the login window on macOS 11-13 when
++			// ScreenCapture TCC is granted (preflight=1 here). CGWindowListCreateImage
++			// composites the on-screen login UI; CGDisplayCreateImage is a last resort.
++			image = kvm_capture_sck((uint32_t)screen_num);
++			if (image == NULL)
++			{
++				image = CGWindowListCreateImage(
++					CGRectInfinite, kCGWindowListOptionOnScreenOnly,
++					kCGNullWindowID, kCGWindowImageDefault);
++				if (image == NULL) image = CGDisplayCreateImage(screen_num);
++			}
++			static int logged_sck_lw = 0;
++			if (!logged_sck_lw) {
++				kvm_flog("loginwindow capture: image=%p preflight=%d\n",
++					image, CGPreflightScreenCaptureAccess());
++				logged_sck_lw = 1;
++			}
++		}
++		else
++		{
++			// User session (uid != 0). This VM is HEADLESS (no display scanout),
++			// so CGDisplayCreateImage / ScreenCaptureKit / screencapture all fail
++			// ("could not create image from display"). CGWindowListCreateImage is
++			// the ONLY working capture path here: it composites the on-screen
++			// window list into an offscreen buffer without needing a display.
++			//   - ScreenCapture TCC denied  -> returns wallpaper + menu bar only
++			//   - ScreenCapture TCC granted  -> returns full window content
++			// Always call it: worst case the user sees the desktop, best case
++			// (TCC granted) they see everything.
++			image = CGWindowListCreateImage(
++				CGRectInfinite,
++				kCGWindowListOptionOnScreenOnly,
++				kCGNullWindowID,
++				kCGWindowImageDefault);
++			static int logged_wl = 0;
++			if (!logged_wl) {
++				kvm_flog("user CGWindowListCreateImage: image=%p preflight=%d\n",
++					image, CGPreflightScreenCaptureAccess());
++				logged_wl = 1;
++			}
++		}
++		if (image == NULL)
++		{
++			// Both public APIs failed (TCC blocked). Try private SkyLight/CGS
++			// capture functions that go through our established WindowServer
++			// connection directly, bypassing the client-side TCC check.
++			static int logged_cgs = 0;
++			static void *sl_handle = NULL;
++			static int (*sl_capture)(int, uint32_t, CGRect, float, CGImageRef *) = NULL;
++			if (sl_handle == NULL)
++			{
++				sl_handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW | RTLD_NOLOAD);
++				if (!sl_handle) sl_handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW);
++				if (sl_handle)
++				{
++					sl_capture = dlsym(sl_handle, "SLSCaptureSizedDisplayRect");
++					if (!sl_capture) sl_capture = dlsym(sl_handle, "CGSCaptureSizedDisplayRect");
++					if (!sl_capture) sl_capture = dlsym(RTLD_DEFAULT, "SLSCaptureSizedDisplayRect");
++					if (!sl_capture) sl_capture = dlsym(RTLD_DEFAULT, "CGSCaptureSizedDisplayRect");
++				}
++				else
++				{
++					// Try RTLD_DEFAULT directly
++					sl_capture = dlsym(RTLD_DEFAULT, "SLSCaptureSizedDisplayRect");
++					if (!sl_capture) sl_capture = dlsym(RTLD_DEFAULT, "CGSCaptureSizedDisplayRect");
++				}
++				if (!logged_cgs)
++				{
++					typedef int CGSConnectionID;
++					extern CGSConnectionID CGSMainConnectionID(void);
++					kvm_flog("SkyLight handle=%p sl_capture=%p cid=%d\n",
++						sl_handle, sl_capture, CGSMainConnectionID());
++					logged_cgs = 1;
++				}
++			}
++			if (sl_capture)
++			{
++				typedef int CGSConnectionID;
++				extern CGSConnectionID CGSMainConnectionID(void);
++				CGSConnectionID cid = CGSMainConnectionID();
++				CGRect fullRect = CGRectMake(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
++				int rc = sl_capture(cid, screen_num, fullRect, 1.0f, &image);
++				if (rc != 0 || image == NULL)
++				{
++					static int logged_sls = 0;
++					if (!logged_sls) { kvm_flog("SLS capture rc=%d image=%p\n", rc, image); logged_sls = 1; }
++					image = NULL;
++				}
++				else
++				{
++					static int logged_ok = 0;
++					if (!logged_ok) { kvm_flog("SLS capture succeeded!\n"); logged_ok = 1; }
++				}
++			}
++		}
++		if (image == NULL)
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
++			// Last resort: ScreenCaptureKit (macOS 14+). Uses a separate
++			// system daemon, so its TCC check may differ from the CoreGraphics
++			// path and might succeed at the loginwindow.
++			extern CGImageRef kvm_capture_sck(uint32_t displayID);
++			static int sck_logged = 0;
++			if (!sck_logged) { kvm_flog("trying SCK fallback\n"); sck_logged = 1; }
++			image = kvm_capture_sck((uint32_t)screen_num);
++		}
++		if (image == NULL)
++		{
++			// All capture APIs failed. Sleep 1s and retry rather than exiting —
++			// launchd won't restart on exit(0), and SCK needs time to settle.
++			static int all_logged = 0;
++			if (!all_logged) { kvm_flog("All capture APIs failed, retrying\n"); all_logged = 1; }
++			if (!g_resetipc && !g_shutdown) usleep(1000000);
++			continue;
+ 		}
+ 		else {
+ 			//senddebug(100);
+@@ -1052,20 +1223,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+ 	}
+ 	else
+ 	{
+-		// No users are logged in. This is a special case for MacOS
+-		//int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+-		//if (!fd < 0)
+-		//{
+-		//	struct sockaddr_un serveraddr;
+-		//	memset(&serveraddr, 0, sizeof(serveraddr));
+-		//	serveraddr.sun_family = AF_UNIX;
+-		//	strcpy(serveraddr.sun_path, kvm_listener_path);
+-		//	if (!connect(fd, (struct sockaddr *)&serveraddr, SUN_LEN(&serveraddr)) < 0)
+-		//	{
+-		//		return((void*)(uint64_t)fd);
+-		//	}
+-		//}
+-		return((void*)kvm_listener_path);
++		// No user logged in — loginwindow session.
++		// The kvmagent LaunchAgent loads into the loginwindow bootstrap domain
++		// (LimitLoadToSessionType = LoginWindow) as root (uid 0) and creates
++		// /tmp/meshagent-kvm-0.sock. Connect to it exactly like the Aqua path.
++		char lwSocketPath[128];
++		snprintf(lwSocketPath, sizeof(lwSocketPath), "/tmp/meshagent-kvm-0.sock");
++		struct stat sockStat;
++		int agentInstalled = (stat(lwSocketPath, &sockStat) == 0 && S_ISSOCK(sockStat.st_mode));
++
++		if (agentInstalled)
++		{
++			int fd = -1;
++			int attempt;
++			for (attempt = 0; attempt < 5; attempt++)
++			{
++				fd = socket(AF_UNIX, SOCK_STREAM, 0);
++				if (fd < 0) break;
++				struct sockaddr_un addr;
++				memset(&addr, 0, sizeof(addr));
++				addr.sun_family = AF_UNIX;
++				strncpy(addr.sun_path, lwSocketPath, sizeof(addr.sun_path) - 1);
++				if (connect(fd, (struct sockaddr*)&addr, SUN_LEN(&addr)) == 0)
++				{
++					g_kvmSocketFD            = fd;
++					g_kvmSocketWriteHandler  = writeHandler;
++					g_kvmSocketReserved      = reserved;
++					g_kvmSocketPipe          = ILibProcessPipe_Pipe_CreateFromExisting((ILibProcessPipe_Manager)processPipeMgr, fd);
++					ILibProcessPipe_Pipe_AddPipeReadHandler(g_kvmSocketPipe, 65535, &kvm_relay_socket_ReadHandler);
++					ILibProcessPipe_Pipe_SetBrokenPipeHandler(g_kvmSocketPipe, &kvm_relay_socket_BrokenHandler);
++					ILibProcessPipe_Pipe_ResetMetadata(g_kvmSocketPipe, "KVM loginwindow-session socket");
++					g_shutdown = 0;
++					ILibMemory_Free(user);
++					return(g_kvmSocketPipe);
++				}
++				close(fd);
++				fd = -1;
++				usleep(50000 << attempt);
++			}
++		}
++		ILibMemory_Free(user);
++		return(NULL);
+ 	}
+ }
+ 
+@@ -1190,4 +1388,45 @@ void kvm_check_permission()
+             CFRelease(URL);
+         }
+     }
++}
++
++// Background thread for -kvmagent mode: polls Accessibility trust status every
++// 3 seconds. When the user grants the permission after the initial prompt,
++// exits with code 2 so launchd restarts the process. The restarted process
++// will call AXIsProcessTrustedWithOptions and get true on the first check,
++// making CGEventPost work immediately without manual intervention.
++static void* ax_poll_thread(void* arg)
++{
++    (void)arg;
++    // Give the process a few seconds to start before checking — avoids
++    // an immediate restart loop if TCC is already granted at launch.
++    sleep(5);
++    while (1)
++    {
++        if (AXIsProcessTrusted())
++        {
++            // Permission just became true (it was false when we started
++            // polling, otherwise we wouldn't have started). Restart so the
++            // main thread picks up the new trust state for CGEventPost.
++            exit(2);
++        }
++        sleep(3);
++    }
++    return NULL;
++}
++
++int kvmagent_ax_poll_start(void)
++{
++    if (__builtin_available(macOS 10.9, *))
++    {
++        // Only start the poll thread if Accessibility is NOT yet granted.
++        // If it's already granted at launch, no restart needed.
++        if (!AXIsProcessTrusted())
++        {
++            pthread_t t;
++            pthread_create(&t, NULL, ax_poll_thread, NULL);
++            pthread_detach(t);
++        }
++    }
++    return 0;
+ }
+\ No newline at end of file

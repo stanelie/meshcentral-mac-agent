@@ -328,11 +328,20 @@ static int avp_kbd_key(CGKeyCode adb, int down)
 
 static IOHIDUserDeviceRef make_hid_device(CFDictionaryRef props)
 {
-    IOHIDUserDeviceRef dev = IOHIDUserDeviceCreateWithProperties(kCFAllocatorDefault, props, 0);
-    if (!dev) return NULL;
-    IOHIDUserDeviceSetDispatchQueue(dev, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0));
-    IOHIDUserDeviceActivate(dev);
-    return dev;
+    // IOHIDUserDevice needs the restricted com.apple.hid.manager.user-device
+    // entitlement, which ad-hoc-signed binaries cannot carry. We never actually
+    // use this virtual-HID path — login-window input goes through screensharingd
+    // VNC and in-session input through CGEventPost — so it is skipped here.
+    //
+    // Skipping it also fixes a hard crash on macOS 11 (Big Sur): there the kernel
+    // denies the create ("IOHIDResourceDeviceUserClient ... not entitled",
+    // IOServiceOpen 0xe00002c2) but IOHIDUserDeviceCreateWithProperties still
+    // returns a NON-NULL, invalid ref, and IOHIDUserDeviceActivate() on it
+    // crashes the process right after kvm_init — before the capture loop — so the
+    // agent restart-loops and the remote screen is permanently black. (On macOS
+    // 14+ the create returned NULL and this was already a no-op.)
+    (void)props;
+    return NULL;
 }
 
 // Standard boot-protocol keyboard report descriptor
@@ -874,32 +883,21 @@ void hid_inject_init(void)
     }
     if (g_kbd_dev && g_mouse_dev) return;  // IOHIDUserDevice succeeded — best path
 
-    // ---- Priority 2: steal the bridge daemon's existing io_connect_t ----
-    // NOTE: On Parallels guests, AppleVirtualPlatformHIDBridge routes events to the host,
-    // not into the local HID stack — keyboard injection will not reach loginwindow here.
-    // On a physical Mac or native Apple VM host, this path injects into the guest VM.
-    g_avp_kbd_conn = steal_avp_kbd_from_bridge();
-    {
-        char b[80]; int l = snprintf(b, sizeof(b), "hid_inject_init: avp_steal=%s\n",
-            g_avp_kbd_conn != IO_OBJECT_NULL ? "OK" : "NULL");
-        write(STDOUT_FILENO, b, l);
-    }
-    if (g_avp_kbd_conn != IO_OBJECT_NULL) return;
+    // Priority 2 / 2b (AppleVirtualPlatform HID bridge) are intentionally DISABLED.
+    // They are never the working injection path on our targets: login-window input
+    // goes through screensharingd VNC and in-session input through CGEventPost, and
+    // on a Parallels/Apple VM guest the bridge routes events to the host rather than
+    // the guest login window. More importantly, on macOS 11 (Big Sur)
+    // steal_avp_kbd_from_bridge()/open_avp_hid_interface() crash the process (IOKit)
+    // — like the IOHIDUserDevice path above — killing the agent right after kvm_init,
+    // before the capture loop, so the remote screen stays black. Skipping them leaves
+    // g_avp_kbd_conn/g_kbd_dev NULL, which is exactly what the injection code already
+    // expects when it falls through to CGEventPost (KeyAction) or vnc_inject (login).
+    (void)&steal_avp_kbd_from_bridge; (void)&open_avp_hid_interface;
 
-    // ---- Priority 2b: direct IOServiceOpen ----
-    g_avp_kbd_conn = open_avp_hid_interface(0);
-    {
-        char b[80]; int l = snprintf(b, sizeof(b), "hid_inject_init: avp_direct=%s\n",
-            g_avp_kbd_conn != IO_OBJECT_NULL ? "OK" : "NULL");
-        write(STDOUT_FILENO, b, l);
-    }
-    if (g_avp_kbd_conn != IO_OBJECT_NULL) return;
-
-    if (!g_kbd_dev) {
-        // Fall back to CGEvent path
-        dispatch_once_f(&g_postOnce, NULL, post_init_once);
-        write(STDOUT_FILENO, "hid_inject_init: falling back to CGEvent\n", 41);
-    }
+    // Fall back to the CGEvent path (in-session). Login window uses vnc_inject.
+    dispatch_once_f(&g_postOnce, NULL, post_init_once);
+    write(STDOUT_FILENO, "hid_inject_init: using CGEvent path\n", 35);
 }
 
 static const int g_keymapLen = 114;

@@ -1,12 +1,13 @@
 # Building the agent binaries
 
-The login-window input change lives entirely in
-`meshcore/KVM/MacOS/mac_events.c` (plus a one-line makefile tweak). Everything else is stock
-[Ylianst/MeshAgent](https://github.com/Ylianst/MeshAgent).
+The changes live in `meshcore/KVM/MacOS/mac_events.c` (login-window input routing + the HID
+init that's macOS-11-safe) and `meshcore/KVM/MacOS/mac_kvm.c` (login-window video capture with
+a CoreGraphics fallback for macOS < 14), plus a one-line makefile tweak. Everything else is
+stock [Ylianst/MeshAgent](https://github.com/Ylianst/MeshAgent).
 
 ## What's here
-- `mac_events.c` — the full modified file (drop-in replacement).
-- `login-kvm.patch` — the exact diff vs the upstream base, for review or an upstream PR.
+- `mac_events.c`, `mac_kvm.c` — the full modified files (drop-in replacements).
+- `login-kvm.patch` — the exact diff vs the upstream base (both files), for review / upstream PR.
 - `kvm_input_harness.c` — a standalone validation tool (see bottom).
 
 ## Build (on a Mac with the Xcode command-line tools)
@@ -15,9 +16,10 @@ The login-window input change lives entirely in
 git clone https://github.com/Ylianst/MeshAgent
 cd MeshAgent
 
-# apply our change — either drop in the file:
+# apply our changes — either drop in the files:
 cp /path/to/agent/mac_events.c meshcore/KVM/MacOS/mac_events.c
-# ...or apply the patch:
+cp /path/to/agent/mac_kvm.c    meshcore/KVM/MacOS/mac_kvm.c
+# ...or apply the patch (covers both files):
 #   git apply /path/to/agent/login-kvm.patch
 
 # Apple Silicon (arm64), agent id 29:

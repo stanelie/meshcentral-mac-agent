@@ -111,6 +111,26 @@ MDM-managed fleets the equivalent is a **PPPC configuration profile** pre-approv
   makes no difference; a full TigerVNC-style client is ignored identically when the helper
   is ungranted.
 
+## macOS version support (Big Sur → Tahoe)
+
+The agent targets macOS 11+ on both architectures. Two areas are version-sensitive and are
+handled in the code:
+
+- **Video capture.** ScreenCaptureKit only exists on macOS 14+. On older systems the agent
+  falls back to CoreGraphics: `CGWindowListCreateImage` in-session, and the same at the
+  **login window** (with `CGDisplayCreateImage` as a further fallback) — these capture the
+  login UI on a physical Mac when Screen Recording is granted. Without the fallback, login
+  video is black on macOS 11-13 (`mac_kvm.c`).
+- **HID init crash on macOS 11.** `hid_inject_init()` used to probe `IOHIDUserDevice` and the
+  AppleVirtualPlatform HID bridge. On Big Sur the denied `IOHIDUserDevice` create returns an
+  invalid (non-NULL) ref and activating it **crashes the process** right after init — before
+  the capture loop — so the agent crash-loops and the screen is permanently black. Those
+  probes are never the working injection path (login = screensharingd VNC, in-session =
+  `CGEventPost`), so they are skipped; the code goes straight to `CGEventPost` (`mac_events.c`).
+
+Neither change affects macOS 14+ behaviour (SCK is used there, and the skipped HID probes
+returned NULL there anyway).
+
 ## Limitations
 
 ### FileVault must be disabled

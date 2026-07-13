@@ -2,7 +2,8 @@
 
 A macOS [MeshCentral](https://meshcentral.com/) agent build and deployment kit that adds
 **full remote desktop — video *and* keyboard *and* mouse — at the macOS login window**,
-including on Apple Silicon and Intel, on modern macOS (verified on **Tahoe 26.5.1**).
+on Apple Silicon and Intel. Verified on **macOS 11 Big Sur through macOS 26 Tahoe**
+(video + keyboard + mouse, in-session and at the login screen).
 
 Stock MeshCentral can show the login screen but **cannot type or click on it**: the
 login window holds *SecureEventInput*, so the WindowServer drops every event injected by
