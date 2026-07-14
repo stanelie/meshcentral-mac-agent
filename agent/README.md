@@ -15,6 +15,7 @@ stock [Ylianst/MeshAgent](https://github.com/Ylianst/MeshAgent).
 ```bash
 git clone https://github.com/Ylianst/MeshAgent
 cd MeshAgent
+git checkout cb62daa82b6f23dd317eac77a16a398db03f43ea   # upstream base this patch targets
 
 # apply our changes — either drop in the files:
 cp /path/to/agent/mac_events.c meshcore/KVM/MacOS/mac_events.c

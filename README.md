@@ -92,13 +92,21 @@ installer/        Client-side install/uninstall
   meshinstall.sh      Hosted installer (arch-detect, agent + login-KVM setup)
   meshinstall.command Double-click launcher that guides the 3 manual steps
   uninstall.sh        Full clean removal
-prebuilt/         Signed thin binaries (arm64 + x86_64), same as served by the server
+  mac_kvm.c           Full modified file (KVM capture / relay for macOS)
+  README.md           How to build the binaries (pins the upstream base commit)
+prebuilt/         Thin binaries (arm64 + x86_64), ad-hoc signed
+signing/          Encrypted signing-key backup + how persistent TCC grants work
 docs/
   architecture.md     The full technical story: SecureEventInput, screensharingd, TCC
+  macos-findings.md   Hard-won gotchas, dead ends, and the unresolved handoff issue
   LOGIN_KVM_FIX.md    Original concise fix note (agent code change)
 server/
   README.md           MeshCentral server-side deployment + re-apply-after-update
+RECOVERY.md       Rebuild everything from this repo + your cert passphrase alone
 ```
+
+If you ever lose your build machine, **[RECOVERY.md](RECOVERY.md)** is the self-contained
+recipe to reconstruct the working agent from this repository plus your certificate passphrase.
 
 ---
 
