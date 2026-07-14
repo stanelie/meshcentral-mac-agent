@@ -1297,7 +1297,7 @@ index c27e1f0..580ed94 100644
 +    CFRelease(e);
  }
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..62880c3 100644
+index 6d57690..a697bec 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -1641,7 +1641,33 @@ index 6d57690..62880c3 100644
  		}
  		else {
  			//senddebug(100);
-@@ -1052,20 +1223,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1159,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+ 		char socketPath[128];
+ 		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
+ 		struct stat sockStat;
+-		int agentInstalled = (stat(socketPath, &sockStat) == 0 && S_ISSOCK(sockStat.st_mode));
++
++		// Right after a login/logout handoff the console UID has just changed and
++		// the NEW session's kvmagent LaunchAgent may still be starting — so its
++		// socket file doesn't exist yet. A single stat() here would wrongly
++		// conclude "agent not installed" and fall through to the broken legacy
++		// fork-exec path, which freezes the viewer until the operator manually
++		// reconnects. Poll briefly for the socket to appear so the viewer rides
++		// through the session switch. Normal (already-running) sessions match on
++		// the first check with no delay.
++		int agentInstalled = 0;
++		{
++			int waitedMs;
++			for (waitedMs = 0; waitedMs <= 5000; waitedMs += 150)
++			{
++				if (stat(socketPath, &sockStat) == 0 && S_ISSOCK(sockStat.st_mode)) { agentInstalled = 1; break; }
++				usleep(150000);
++			}
++		}
+ 
+ 		if (agentInstalled)
+ 		{
+@@ -1052,20 +1240,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -1703,7 +1729,7 @@ index 6d57690..62880c3 100644
  	}
  }
  
-@@ -1190,4 +1388,45 @@ void kvm_check_permission()
+@@ -1190,4 +1405,45 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

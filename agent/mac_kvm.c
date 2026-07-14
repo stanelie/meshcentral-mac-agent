@@ -1159,7 +1159,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler 
 		char socketPath[128];
 		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
 		struct stat sockStat;
-		int agentInstalled = (stat(socketPath, &sockStat) == 0 && S_ISSOCK(sockStat.st_mode));
+
+		// Right after a login/logout handoff the console UID has just changed and
+		// the NEW session's kvmagent LaunchAgent may still be starting — so its
+		// socket file doesn't exist yet. A single stat() here would wrongly
+		// conclude "agent not installed" and fall through to the broken legacy
+		// fork-exec path, which freezes the viewer until the operator manually
+		// reconnects. Poll briefly for the socket to appear so the viewer rides
+		// through the session switch. Normal (already-running) sessions match on
+		// the first check with no delay.
+		int agentInstalled = 0;
+		{
+			int waitedMs;
+			for (waitedMs = 0; waitedMs <= 5000; waitedMs += 150)
+			{
+				if (stat(socketPath, &sockStat) == 0 && S_ISSOCK(sockStat.st_mode)) { agentInstalled = 1; break; }
+				usleep(150000);
+			}
+		}
 
 		if (agentInstalled)
 		{
