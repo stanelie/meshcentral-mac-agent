@@ -17,6 +17,23 @@ and one unresolved issue so they aren't rediscovered the hard way.
 - Dead ends: `kickstart -activate … -privs -all` (ARD managed mode) does **not** grant input;
   a "fuller" RFB handshake makes no difference; the block is purely the helper's TCC grant.
 
+## Login-window VNC keyboard silently dropped Shift'ed characters
+- Symptom: typing a password containing a symbol (e.g. `!`) or an uppercase letter at the
+  login window produced the *unshifted* character instead (`!` → `1`), so any password with
+  such characters failed to unlock — while the same password worked fine once logged in
+  (in-session input uses a different path, `CGEventKeyboardSetUnicodeString`, unaffected).
+- Root cause: the RFB `KeyEvent` sender (`vnc_inject_key` in `mac_events.c`) mapped each
+  physical key to only its **unshifted** X11 keysym and sent a separate Shift-down `KeyEvent`
+  alongside it, assuming `screensharingd` would combine the two like an X server would. It
+  doesn't reliably do that — the base keysym was injected as typed, ignoring the held Shift.
+- Fix: track Shift state client-side and resolve the **shifted** keysym ourselves (US layout)
+  before sending a single fully-resolved `KeyEvent`, the same way Enter/Tab/arrows etc. were
+  already sent as one resolved keysym rather than a raw scancode. No dependency on the
+  receiver combining modifier + base key.
+- Diagnostic tip: the login window's **username field** is plaintext (unlike the password
+  field's dots), so typing test characters there while watching what actually appears is a
+  reliable way to debug keysym-mapping issues without needing real credentials.
+
 ## macOS version compatibility (Big Sur–Ventura vs Sonoma+)
 - **ScreenCaptureKit is macOS 14+.** On 11–13 the agent falls back to `CGWindowListCreateImage`
   (in-session and at the login window) / `CGDisplayCreateImage`; without that, login video is

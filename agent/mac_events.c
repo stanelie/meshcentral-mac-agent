@@ -73,6 +73,7 @@ static int      g_vnc_fd          = -1;   // TCP socket to localhost:5900, -1 if
 static time_t   g_vnc_last_attempt = 0;   // unix timestamp of last connect attempt
 static int      g_lw_cached       = -1;   // cached loginwindow state (-1=unknown, 0=no, 1=yes)
 static time_t   g_lw_cache_time   = 0;    // timestamp of last loginwindow check
+static int      g_vnc_shift_down  = 0;    // tracks physical Shift state for the VNC key path
 
 // ---- Helpers ---------------------------------------------------------------
 static pid_t find_proc_by_name(const char *name)
@@ -726,6 +727,38 @@ static uint32_t adb_to_x11keysym(CGKeyCode adb)
     return 0;
 }
 
+// US-layout shifted keysym for physical digit/punctuation keys (e.g. '1' -> '!').
+// screensharingd does not reliably combine a separately-sent Shift keysym with
+// an unshifted character keysym, so the VNC path resolves the shifted character
+// itself and sends that keysym directly instead.
+static uint32_t adb_to_shifted_keysym(uint8_t adb)
+{
+    switch (adb) {
+        case 0x12: return 0x0021; // 1 -> !
+        case 0x13: return 0x0040; // 2 -> @
+        case 0x14: return 0x0023; // 3 -> #
+        case 0x15: return 0x0024; // 4 -> $
+        case 0x17: return 0x0025; // 5 -> %
+        case 0x16: return 0x005E; // 6 -> ^
+        case 0x1A: return 0x0026; // 7 -> &
+        case 0x1C: return 0x002A; // 8 -> *
+        case 0x19: return 0x0028; // 9 -> (
+        case 0x1D: return 0x0029; // 0 -> )
+        case 0x1B: return 0x005F; // - -> _
+        case 0x18: return 0x002B; // = -> +
+        case 0x21: return 0x007B; // [ -> {
+        case 0x1E: return 0x007D; // ] -> }
+        case 0x2A: return 0x007C; // \ -> |
+        case 0x29: return 0x003A; // ; -> :
+        case 0x27: return 0x0022; // ' -> "
+        case 0x32: return 0x007E; // ` -> ~
+        case 0x2B: return 0x003C; // , -> <
+        case 0x2F: return 0x003E; // . -> >
+        case 0x2C: return 0x003F; // / -> ?
+        default:   return 0;
+    }
+}
+
 // Send an RFB KeyEvent to screensharingd/localhost:5900.
 // Reconnects automatically if the connection dropped (with 5s backoff).
 static void vnc_inject_key(CGKeyCode adb, int down)
@@ -737,7 +770,18 @@ static void vnc_inject_key(CGKeyCode adb, int down)
         if (!vnc_connect()) return;
     }
 
-    uint32_t sym = adb_to_x11keysym(adb);
+    // L-Shift (0x38) / R-Shift (0x3C): track state, send their own keysym as before.
+    if (adb == 0x38 || adb == 0x3C) { g_vnc_shift_down = down; }
+
+    uint32_t sym = 0;
+    if (g_vnc_shift_down && adb != 0x38 && adb != 0x3C) {
+        sym = adb_to_shifted_keysym((uint8_t)adb);
+        if (!sym) {
+            uint32_t base = adb_to_x11keysym(adb);
+            if (base >= 0x61 && base <= 0x7A) sym = base - 0x20; // a-z -> A-Z
+        }
+    }
+    if (!sym) sym = adb_to_x11keysym(adb);
     if (!sym) {
         char b[64]; int l = snprintf(b, sizeof(b), "vnc_key: adb=0x%x no keysym\n", (unsigned)adb);
         write(STDOUT_FILENO, b, l);
