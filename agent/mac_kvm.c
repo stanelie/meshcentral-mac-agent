@@ -832,23 +832,30 @@ void* kvm_server_mainloop(void* param)
 		}
 		else
 		{
-			// User session (uid != 0). This VM is HEADLESS (no display scanout),
-			// so CGDisplayCreateImage / ScreenCaptureKit / screencapture all fail
-			// ("could not create image from display"). CGWindowListCreateImage is
-			// the ONLY working capture path here: it composites the on-screen
-			// window list into an offscreen buffer without needing a display.
-			//   - ScreenCapture TCC denied  -> returns wallpaper + menu bar only
-			//   - ScreenCapture TCC granted  -> returns full window content
-			// Always call it: worst case the user sees the desktop, best case
-			// (TCC granted) they see everything.
-			image = CGWindowListCreateImage(
-				CGRectInfinite,
-				kCGWindowListOptionOnScreenOnly,
-				kCGNullWindowID,
-				kCGWindowImageDefault);
+			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
+			// display directly instead of compositing the window list, and measured
+			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
+			// was obsoleted in macOS 15.0 and its post-deprecation fallback path is
+			// catastrophically slow — ~1s/call — on at least one tested machine,
+			// vs 3-7ms/call for CGDisplayCreateImage on the same hardware).
+			// Fall back to CGWindowListCreateImage only if CGDisplayCreateImage
+			// fails, which happens on HEADLESS VMs (no display scanout): there,
+			// CGDisplayCreateImage / ScreenCaptureKit / screencapture all fail
+			// ("could not create image from display"), but CGWindowListCreateImage
+			// still works by compositing on-screen window content into an offscreen
+			// buffer without needing a real display.
+			image = CGDisplayCreateImage(screen_num);
+			if (image == NULL)
+			{
+				image = CGWindowListCreateImage(
+					CGRectInfinite,
+					kCGWindowListOptionOnScreenOnly,
+					kCGNullWindowID,
+					kCGWindowImageDefault);
+			}
 			static int logged_wl = 0;
 			if (!logged_wl) {
-				kvm_flog("user CGWindowListCreateImage: image=%p preflight=%d\n",
+				kvm_flog("user capture: image=%p preflight=%d\n",
 					image, CGPreflightScreenCaptureAccess());
 				logged_wl = 1;
 			}

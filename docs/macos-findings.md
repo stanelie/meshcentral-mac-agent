@@ -100,3 +100,46 @@ palliative would be to wrap the remaining unguarded `consoleUid()` calls in `mes
   `--identifier`, or the grant stops matching.
 - A stale Screen Recording entry for the agent's path **suppresses the re-prompt** after a binary
   change: remove it in System Settings (and reboot) so a fresh install prompts again.
+
+## Slow / OpenCore-Legacy-Patcher hardware: single-thread starvation (2026-07-23)
+On a 2015 MacBookAir7,2 running macOS 15.7.7 via **OpenCore Legacy Patcher**, the Desktop
+session was unusable (black screen, random disconnects, multi-second input lag). Root cause was
+never one bug — it was several things each stalling the agent's **single JS thread**, which on
+this slow, unsupported-GPU hardware was enough to starve the KVM video/input relay:
+
+- **`kvm_check_permission()` from the root daemon**: requested TCC prompts (`AXIsProcessTrusted`
+  with prompt, `CGRequestScreenCaptureAccess`) from a LaunchDaemon with no GUI session → hung the
+  daemon. Guarded to the per-user kvmagent (`getuid()!=0`). (`agentcore.c`)
+- **`ax_poll` `exit(2)` from the daemon**: the Accessibility-grant poll thread `exit(2)`s to force a
+  launchd restart, but the daemon's `KeepAlive` is `{Crashed:true}` only — a clean exit killed it
+  permanently. Guarded to the kvmagent. (`meshconsole/main.c`)
+- **In-session capture via `CGWindowListCreateImage`**: obsoleted in macOS 15 and **~1s/call** on
+  this hardware (vs 3–7ms for `CGDisplayCreateImage`). Switched in-session capture to
+  `CGDisplayCreateImage` first, falling back to the window-list API only when it fails (headless
+  VMs). Measured with a `dlsym` micro-bench since the SDK hard-errors on the obsoleted symbol.
+  (`mac_kvm.c`)
+- **Clipboard auto-poll was the biggest culprit.** The MeshCentral viewer polls the remote
+  clipboard **every ~1s** when "Auto clipboard" is on (`getclip tag:3`). Each poll ran, on the root
+  daemon's JS thread, a `zsh` + **`su -`** login shell to run `pbpaste`/`pbcopy` — because those
+  tools must reach `pasteboardd` in the user's **Aqua GUI Mach-bootstrap namespace**, which the root
+  daemon isn't in. On this hardware every spawn is **~0.8s** (even `launchctl asuser` and a bare
+  `execFile({uid})` — the process *spawn itself* is the cost, not just session-crossing). At 1/s
+  this consumed most of the thread. `clipboard.js`'s `dispatchRead/Write` also called
+  `consoleUid()` (two more `/bin/sh` spawns) on darwin where the result is unused — removed.
+
+### Native clipboard (the fix)
+dwservice is smooth on macOS partly because its macOS clipboard is a **no-op stub**; its real design
+elsewhere is on-demand + change-detected, run **inside the user session**. We took the same
+principle: a **native `NSPasteboard`** clipboard served by the in-session **kvmagent** (already in the
+Aqua session, so pasteboard access is a few ms with **no spawn**), exposed over a dedicated unix
+socket `/tmp/meshagent-clip.sock` from an **isolated pthread** (so the KVM relay is untouched). The
+root daemon's `message-box.js` `get/setClipboard` connect to that socket instead of spawning shells.
+Wire protocol: `R`→`[u32 changeCount][u32 len][len UTF8]`, `C`→`[u32 changeCount]`,
+`W[u32 len][data]`→`K`. (`mac_kvm_sck.m`, `meshconsole/main.c`, `makefile` adds `-framework AppKit`,
+`modules/message-box.js`.)
+
+**Status:** video + input + **local→remote** clipboard confirmed working and smooth with
+auto-clipboard on. **remote→local** clipboard is still under investigation (the native read works
+end-to-end when tested directly against the socket as root; the path from the viewer's 1s poll back
+to the local browser clipboard is not yet delivering — likely the viewer-side `document.hasFocus()` /
+`deskLastClipboardReceived` dedup interaction, still being debugged).

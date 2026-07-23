@@ -1,5 +1,5 @@
 diff --git a/makefile b/makefile
-index fb8c1c5..d0ea32c 100644
+index fb8c1c5..eb25892 100644
 --- a/makefile
 +++ b/makefile
 @@ -800,7 +800,8 @@ linux:
@@ -8,9 +8,121 @@ index fb8c1c5..d0ea32c 100644
  macos:
 -	$(MAKE) $(MAKEFILE) EXENAME="$(EXENAME)_$(ARCHNAME)" ADDITIONALSOURCES="$(MACOSKVMSOURCES)" CFLAGS="$(MACOSARCH) -std=gnu99 -Wall -DJPEGMAXBUF=$(KVMMaxTile) -DMESH_AGENTID=$(ARCHID) -D_POSIX -D_NOILIBSTACKDEBUG -D_NOHECI -DMICROSTACK_PROXY -D__APPLE__ $(CWEBLOG) -fno-strict-aliasing $(INCDIRS) $(CFLAGS) $(CEXTRA)" LDFLAGS="$(MACSSL) $(MACOSFLAGS) -L. -lpthread -ldl -lz -lutil -framework IOKit -framework ApplicationServices -framework SystemConfiguration -framework CoreServices -framework CoreGraphics -framework CoreFoundation -fconstant-cfstrings $(LDFLAGS) $(LDEXTRA)"
 +	clang $(MACOSARCH) -fobjc-arc -Wall -fno-strict-aliasing $(INCDIRS) -c meshcore/KVM/MacOS/mac_kvm_sck.m -o meshcore/KVM/MacOS/mac_kvm_sck.o
-+	$(MAKE) $(MAKEFILE) EXENAME="$(EXENAME)_$(ARCHNAME)" ADDITIONALSOURCES="$(MACOSKVMSOURCES)" CFLAGS="$(MACOSARCH) -std=gnu99 -Wall -DJPEGMAXBUF=$(KVMMaxTile) -DMESH_AGENTID=$(ARCHID) -D_POSIX -D_NOILIBSTACKDEBUG -D_NOHECI -DMICROSTACK_PROXY -D__APPLE__ $(CWEBLOG) -fno-strict-aliasing $(INCDIRS) $(CFLAGS) $(CEXTRA)" LDFLAGS="$(MACSSL) $(MACOSFLAGS) -L. -lpthread -ldl -lz -lutil -framework IOKit -framework ApplicationServices -framework SystemConfiguration -framework CoreServices -framework CoreGraphics -framework CoreFoundation -framework ScreenCaptureKit -framework Foundation -fconstant-cfstrings $(LDFLAGS) $(LDEXTRA)" ADDITIONALFLAGS="meshcore/KVM/MacOS/mac_kvm_sck.o"
++	$(MAKE) $(MAKEFILE) EXENAME="$(EXENAME)_$(ARCHNAME)" ADDITIONALSOURCES="$(MACOSKVMSOURCES)" CFLAGS="$(MACOSARCH) -std=gnu99 -Wall -DJPEGMAXBUF=$(KVMMaxTile) -DMESH_AGENTID=$(ARCHID) -D_POSIX -D_NOILIBSTACKDEBUG -D_NOHECI -DMICROSTACK_PROXY -D__APPLE__ $(CWEBLOG) -fno-strict-aliasing $(INCDIRS) $(CFLAGS) $(CEXTRA)" LDFLAGS="$(MACSSL) $(MACOSFLAGS) -L. -lpthread -ldl -lz -lutil -framework IOKit -framework ApplicationServices -framework SystemConfiguration -framework CoreServices -framework CoreGraphics -framework CoreFoundation -framework ScreenCaptureKit -framework Foundation -framework AppKit -fconstant-cfstrings $(LDFLAGS) $(LDEXTRA)" ADDITIONALFLAGS="meshcore/KVM/MacOS/mac_kvm_sck.o"
  	$(SYMBOLCP)
  	$(STRIP)
+ 
+diff --git a/meshconsole/main.c b/meshconsole/main.c
+index b70a508..d403f67 100644
+--- a/meshconsole/main.c
++++ b/meshconsole/main.c
+@@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
+ #include <bsm/audit.h>
+ #include <bsm/audit_session.h>
+ #include <unistd.h>
++#include <ApplicationServices/ApplicationServices.h>
+ #endif
+ 
+ 
+@@ -102,6 +103,17 @@ int main(int argc, char **argv)
+ 	int retCode = 0;
+ 	int capabilities = 0;
+ 
++#if defined(__APPLE__)
++	{
++		// Absolute earliest diagnostic log — before any arg checks or init.
++		// /var/log is writable by root; stderr is captured by launchd StandardErrorPath.
++		const char *_arg1 = (argc > 1) ? argv[1] : "(none)";
++		FILE *_ef = fopen("/var/log/kvm_early.log", "a");
++		if (_ef) { fprintf(_ef, "main() argc=%d argv[1]=%s uid=%d pid=%d\n", argc, _arg1, (int)getuid(), (int)getpid()); fclose(_ef); }
++		fprintf(stderr, "main() argc=%d argv[1]=%s uid=%d pid=%d\n", argc, _arg1, (int)getuid(), (int)getpid());
++	}
++#endif
++
+ #ifdef WIN32
+ 	int argvi, argvsz;
+ 	char **argv = (char**)ILibMemory_SmartAllocate(argc * sizeof(void*));
+@@ -327,8 +339,80 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+ 				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
+ 			kvm_set_listener_path(defaultPath);
+ 		}
++		// Join the correct Quartz audit session so CoreGraphics APIs work.
++		// For the Aqua case (uid != 0) join the user's GUI session.
++		// For the LoginWindow case (uid == 0) there is no logged-in user;
++		// join the WindowServer's session directly so CGMainDisplayID()
++		// returns a valid display ID instead of 0.
++		{
++			extern int ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(uid_t uid);
++			extern int ILibProcessPipe_JoinWindowServerAuditSession_OSX(void);
++			if (getuid() == 0)
++			{
++				int joinRC = ILibProcessPipe_JoinWindowServerAuditSession_OSX();
++				FILE *_f = fopen("/tmp/kvm_debug.log", "a");
++				if (_f) { fprintf(_f, "JoinWindowServerAuditSession rc=%d\n", joinRC); fclose(_f); }
++			}
++			else
++				ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(getuid());
++		}
++		// Explicitly open a CoreGraphics server connection so that CG display
++		// APIs (CGMainDisplayID, CGDisplayPixelsHigh, CGDisplayCreateImage, …)
++		// work when running as root in the loginwindow bootstrap domain.  The
++		// audit-session join above is necessary but insufficient: without an
++		// explicit CGS connection the CG framework returns stale / zero values.
++		{
++			typedef int CGSConnectionID;
++			extern int CGSNewConnection(int, CGSConnectionID *);
++			CGSConnectionID cgCid = 0;
++			int cgRC = CGSNewConnection(0, &cgCid);
++			FILE *_f = fopen("/tmp/kvm_debug.log", "a");
++			if (_f) { fprintf(_f, "CGSNewConnection rc=%d cid=%d\n", cgRC, cgCid); fclose(_f); }
++		}
++		// Request Accessibility permission if not already granted (Aqua only).
++		// AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt triggers
++		// the system dialog so the user can approve it from the VM screen.
++		if (__builtin_available(macOS 10.9, *))
++		{
++			int _axTrusted = (int)AXIsProcessTrusted();
++			FILE *_axf = fopen("/tmp/kvm_debug.log", "a");
++			if (_axf) { fprintf(_axf, "AXIsProcessTrusted=%d at startup (uid=%d)\n", _axTrusted, (int)getuid()); fclose(_axf); }
++			if (!_axTrusted && getuid() != 0)
++			{
++				CFStringRef _k = kAXTrustedCheckOptionPrompt;
++				CFBooleanRef _v = kCFBooleanTrue;
++				CFDictionaryRef _opts = CFDictionaryCreate(NULL,
++					(const void **)&_k, (const void **)&_v, 1,
++					&kCFCopyStringDictionaryKeyCallBacks,
++					&kCFTypeDictionaryValueCallBacks);
++				AXIsProcessTrustedWithOptions(_opts);
++				CFRelease(_opts);
++			}
++		}
++		// Poll for Accessibility permission in a background thread. When
++		// the user grants it after the prompt, exit with a non-zero code so
++		// launchd restarts the process — the fresh process will start with
++		// the permission already granted and CGEventPost will work.
++		// Aqua (kvmagent) only: the root daemon (uid 0) doesn't use
++		// CGEventPost and its LaunchDaemon has KeepAlive:{Crashed:true} —
++		// a clean exit(2) from this poll would kill it permanently, since
++		// that's not a crash and launchd would not restart it.
++		if (getuid() != 0)
++		{
++			extern int kvmagent_ax_poll_start(void);
++			kvmagent_ax_poll_start();
++
++			// In-session only: serve native clipboard over a dedicated socket
++			// so the root daemon can read/write the pasteboard without spawning
++			// a per-call shell (which costs ~0.8s on slower hardware). Isolated
++			// detached thread; does not touch the KVM relay.
++			extern void dwclip_start_listener(void);
++			dwclip_start_listener();
++		}
+ 		kvm_server_mainloop((void*)(uint64_t)getpid());
+-		return 0;
++		// Non-zero exit so launchd (SuccessfulExit:false or KeepAlive:true)
++		// always restarts us after any termination, including SIGTERM.
++		return 1;
+ 	}
+ #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
 index c27e1f0..096418c 100644
@@ -1341,7 +1453,7 @@ index c27e1f0..096418c 100644
 +    CFRelease(e);
  }
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..a697bec 100644
+index 6d57690..8019f1e 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -1542,7 +1654,7 @@ index 6d57690..a697bec 100644
  		if (SCREEN_SCALE_SET == 0)
  		{
  			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
-@@ -741,19 +795,136 @@ void* kvm_server_mainloop(void* param)
+@@ -741,19 +795,143 @@ void* kvm_server_mainloop(void* param)
  		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
  		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
  		
@@ -1563,7 +1675,9 @@ index 6d57690..a697bec 100644
 +		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 +		CGImageRef image = NULL;
 +		if (getuid() == 0)
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
 +			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
 +			// back to the standard CoreGraphics capture APIs: on a PHYSICAL Mac (not
@@ -1587,23 +1701,30 @@ index 6d57690..a697bec 100644
 +		}
 +		else
 +		{
-+			// User session (uid != 0). This VM is HEADLESS (no display scanout),
-+			// so CGDisplayCreateImage / ScreenCaptureKit / screencapture all fail
-+			// ("could not create image from display"). CGWindowListCreateImage is
-+			// the ONLY working capture path here: it composites the on-screen
-+			// window list into an offscreen buffer without needing a display.
-+			//   - ScreenCapture TCC denied  -> returns wallpaper + menu bar only
-+			//   - ScreenCapture TCC granted  -> returns full window content
-+			// Always call it: worst case the user sees the desktop, best case
-+			// (TCC granted) they see everything.
-+			image = CGWindowListCreateImage(
-+				CGRectInfinite,
-+				kCGWindowListOptionOnScreenOnly,
-+				kCGNullWindowID,
-+				kCGWindowImageDefault);
++			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
++			// display directly instead of compositing the window list, and measured
++			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
++			// was obsoleted in macOS 15.0 and its post-deprecation fallback path is
++			// catastrophically slow — ~1s/call — on at least one tested machine,
++			// vs 3-7ms/call for CGDisplayCreateImage on the same hardware).
++			// Fall back to CGWindowListCreateImage only if CGDisplayCreateImage
++			// fails, which happens on HEADLESS VMs (no display scanout): there,
++			// CGDisplayCreateImage / ScreenCaptureKit / screencapture all fail
++			// ("could not create image from display"), but CGWindowListCreateImage
++			// still works by compositing on-screen window content into an offscreen
++			// buffer without needing a real display.
++			image = CGDisplayCreateImage(screen_num);
++			if (image == NULL)
++			{
++				image = CGWindowListCreateImage(
++					CGRectInfinite,
++					kCGWindowListOptionOnScreenOnly,
++					kCGNullWindowID,
++					kCGWindowImageDefault);
++			}
 +			static int logged_wl = 0;
 +			if (!logged_wl) {
-+				kvm_flog("user CGWindowListCreateImage: image=%p preflight=%d\n",
++				kvm_flog("user capture: image=%p preflight=%d\n",
 +					image, CGPreflightScreenCaptureAccess());
 +				logged_wl = 1;
 +			}
@@ -1663,9 +1784,7 @@ index 6d57690..a697bec 100644
 +			}
 +		}
 +		if (image == NULL)
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// Last resort: ScreenCaptureKit (macOS 14+). Uses a separate
 +			// system daemon, so its TCC check may differ from the CoreGraphics
 +			// path and might succeed at the loginwindow.
@@ -1685,7 +1804,7 @@ index 6d57690..a697bec 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1159,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1166,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -1711,7 +1830,7 @@ index 6d57690..a697bec 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1240,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1247,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -1773,7 +1892,7 @@ index 6d57690..a697bec 100644
  	}
  }
  
-@@ -1190,4 +1405,45 @@ void kvm_check_permission()
+@@ -1190,4 +1412,45 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }
@@ -1820,3 +1939,383 @@ index 6d57690..a697bec 100644
 +    return 0;
  }
 \ No newline at end of file
+diff --git a/meshcore/KVM/MacOS/mac_kvm_sck.m b/meshcore/KVM/MacOS/mac_kvm_sck.m
+new file mode 100644
+index 0000000..f8e63d8
+--- /dev/null
++++ b/meshcore/KVM/MacOS/mac_kvm_sck.m
+@@ -0,0 +1,277 @@
++/*
++ * ScreenCaptureKit wrapper for MeshAgent KVM.
++ *
++ * Provides kvm_capture_sck(displayID) → CGImageRef (caller must CGImageRelease)
++ * using SCScreenshotManager (macOS 14+, Sonoma/Tahoe).  Returns NULL on failure.
++ *
++ * Compiled as Objective-C because SCK has no C API.  Linked separately to
++ * avoid mixing -std=gnu99 with ObjC in the same translation unit.
++ */
++
++#import <ScreenCaptureKit/ScreenCaptureKit.h>
++#import <Foundation/Foundation.h>
++#include <CoreGraphics/CoreGraphics.h>
++#include <dispatch/dispatch.h>
++#include <stdarg.h>
++#include <stdio.h>
++
++static void sck_flog(const char *fmt, ...) {
++    FILE *f = fopen("/tmp/kvm_debug.log", "a");
++    if (!f) return;
++    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
++    fflush(f); fclose(f);
++}
++
++API_AVAILABLE(macos(14.0))
++static CGImageRef _kvm_sck_capture_impl(uint32_t displayID)
++{
++    __block CGImageRef result = NULL;
++    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
++
++    [SCShareableContent getShareableContentExcludingDesktopWindows:NO
++                                           onScreenWindowsOnly:NO
++                                               completionHandler:^(SCShareableContent *content, NSError *err) {
++        if (err || !content) {
++            sck_flog("SCShareableContent failed: %s\n",
++                err ? [[err localizedDescription] UTF8String] : "nil content");
++            dispatch_semaphore_signal(sem);
++            return;
++        }
++
++        sck_flog("SCShareableContent: %lu displays %lu windows\n",
++            (unsigned long)content.displays.count,
++            (unsigned long)content.windows.count);
++
++        SCDisplay *target = nil;
++        for (SCDisplay *d in content.displays) {
++            sck_flog("  SCDisplay id=%u frame=%.0fx%.0f\n",
++                d.displayID, d.frame.size.width, d.frame.size.height);
++            if (d.displayID == displayID) { target = d; break; }
++        }
++        if (!target && content.displays.count > 0)
++            target = content.displays.firstObject;
++
++        if (!target) {
++            sck_flog("SCShareableContent: no display\n");
++            dispatch_semaphore_signal(sem);
++            return;
++        }
++
++        SCContentFilter *filter =
++            [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
++
++        SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
++        cfg.width  = (size_t)target.frame.size.width;
++        cfg.height = (size_t)target.frame.size.height;
++        cfg.pixelFormat = kCVPixelFormatType_32BGRA;
++        cfg.showsCursor = YES;   // include the cursor so the remote sees mouse movement
++
++        [SCScreenshotManager captureImageWithFilter:filter
++                                      configuration:cfg
++                                  completionHandler:^(CGImageRef img, NSError *e2) {
++            if (e2 || !img) {
++                sck_flog("SCScreenshotManager failed: %s\n",
++                    e2 ? [[e2 localizedDescription] UTF8String] : "nil image");
++            } else {
++                CGImageRetain(img);
++                result = img;
++                sck_flog("SCScreenshotManager: captured %zux%zu\n",
++                    CGImageGetWidth(img), CGImageGetHeight(img));
++            }
++            dispatch_semaphore_signal(sem);
++        }];
++    }];
++
++    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC);
++    if (dispatch_semaphore_wait(sem, deadline) != 0)
++        sck_flog("SCK: timed out waiting for capture\n");
++
++    return result;
++}
++
++/* C-callable entry point declared in mac_kvm.c */
++CGImageRef kvm_capture_sck(uint32_t displayID)
++{
++    if (@available(macOS 14.0, *)) {
++        return _kvm_sck_capture_impl(displayID);
++    }
++    sck_flog("kvm_capture_sck: needs macOS 14+\n");
++    return NULL;
++}
++
++/* ---------------------------------------------------------------------------
++ * Native clipboard for the in-session (Aqua) kvmagent.
++ *
++ * The root daemon cannot read/write the user pasteboard cheaply: pbpaste/pbcopy
++ * (or any spawn) cost ~0.8s on slower hardware because the process must reach
++ * pasteboardd in the user's GUI Mach-bootstrap namespace. The kvmagent already
++ * runs inside that session, so NSPasteboard here is a few ms with no spawn.
++ *
++ * We expose it over a tiny dedicated unix socket (/tmp/meshagent-clip.sock),
++ * served by an isolated detached pthread so the KVM relay path is untouched.
++ * The daemon's clipboard JS connects to this socket instead of spawning shells.
++ *
++ * Wire protocol (one op per connection):
++ *   Read:        client sends 'R'
++ *                server replies [u32 changeCount][u32 dataLen][dataLen UTF8 bytes]
++ *   ChangeCount: client sends 'C'
++ *                server replies [u32 changeCount]
++ *   Write:       client sends 'W'[u32 dataLen][dataLen UTF8 bytes]
++ *                server replies 'K'
++ * All integers big-endian.
++ * ------------------------------------------------------------------------- */
++
++#import <AppKit/AppKit.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <sys/stat.h>
++#include <pthread.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <arpa/inet.h>
++
++#define DWCLIP_SOCK_PATH "/tmp/meshagent-clip.sock"
++
++static long dwclip_changecount(void)
++{
++    @autoreleasepool {
++        return (long)[[NSPasteboard generalPasteboard] changeCount];
++    }
++}
++
++// Returns malloc'd UTF8 buffer (caller frees) and sets *outLen; NULL if empty.
++static char* dwclip_read(size_t *outLen)
++{
++    @autoreleasepool {
++        NSString *s = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];
++        if (s == nil) { *outLen = 0; return NULL; }
++        const char *utf8 = [s UTF8String];
++        if (utf8 == NULL) { *outLen = 0; return NULL; }
++        size_t n = strlen(utf8);
++        char *buf = (char*)malloc(n > 0 ? n : 1);
++        if (buf == NULL) { *outLen = 0; return NULL; }
++        memcpy(buf, utf8, n);
++        *outLen = n;
++        return buf;
++    }
++}
++
++static void dwclip_write(const char *utf8, size_t len)
++{
++    @autoreleasepool {
++        NSString *s = [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
++        if (s == nil) return;
++        NSPasteboard *pb = [NSPasteboard generalPasteboard];
++        [pb clearContents];
++        [pb setString:s forType:NSPasteboardTypeString];
++    }
++}
++
++static int dwclip_read_all(int fd, void *buf, size_t n)
++{
++    size_t got = 0;
++    while (got < n)
++    {
++        ssize_t r = read(fd, (char*)buf + got, n - got);
++        if (r <= 0) return -1;
++        got += (size_t)r;
++    }
++    return 0;
++}
++
++static int dwclip_write_all(int fd, const void *buf, size_t n)
++{
++    size_t sent = 0;
++    while (sent < n)
++    {
++        ssize_t r = write(fd, (const char*)buf + sent, n - sent);
++        if (r <= 0) return -1;
++        sent += (size_t)r;
++    }
++    return 0;
++}
++
++static void dwclip_handle_conn(int fd)
++{
++    unsigned char op;
++    if (dwclip_read_all(fd, &op, 1) != 0) return;
++
++    if (op == 'C')
++    {
++        uint32_t cc = htonl((uint32_t)dwclip_changecount());
++        dwclip_write_all(fd, &cc, 4);
++    }
++    else if (op == 'R')
++    {
++        size_t len = 0;
++        char *data = dwclip_read(&len);
++        uint32_t cc = htonl((uint32_t)dwclip_changecount());
++        uint32_t nlen = htonl((uint32_t)len);
++        dwclip_write_all(fd, &cc, 4);
++        dwclip_write_all(fd, &nlen, 4);
++        if (len > 0 && data != NULL) dwclip_write_all(fd, data, len);
++        if (data != NULL) free(data);
++    }
++    else if (op == 'W')
++    {
++        uint32_t nlen;
++        if (dwclip_read_all(fd, &nlen, 4) != 0) return;
++        uint32_t len = ntohl(nlen);
++        if (len > 32 * 1024 * 1024) return; // sanity cap
++        char *data = (char*)malloc(len > 0 ? len : 1);
++        if (data == NULL) return;
++        if (len > 0 && dwclip_read_all(fd, data, len) != 0) { free(data); return; }
++        dwclip_write(data, len);
++        free(data);
++        unsigned char ack = 'K';
++        dwclip_write_all(fd, &ack, 1);
++    }
++}
++
++static void* dwclip_listener_thread(void *arg)
++{
++    (void)arg;
++    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (lfd < 0) return NULL;
++
++    struct sockaddr_un addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, DWCLIP_SOCK_PATH, sizeof(addr.sun_path) - 1);
++    unlink(DWCLIP_SOCK_PATH);
++
++    if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(lfd); return NULL; }
++    // Root daemon connects; owner is the session user. Allow all so connect works
++    // regardless of who the daemon runs as; the socket only exposes clipboard.
++    chmod(DWCLIP_SOCK_PATH, 0666);
++    if (listen(lfd, 8) < 0) { close(lfd); return NULL; }
++
++    sck_flog("dwclip: listening on %s\n", DWCLIP_SOCK_PATH);
++
++    for (;;)
++    {
++        int cfd = accept(lfd, NULL, NULL);
++        if (cfd < 0)
++        {
++            if (errno == EINTR) continue;
++            break;
++        }
++        dwclip_handle_conn(cfd);
++        close(cfd);
++    }
++    close(lfd);
++    return NULL;
++}
++
++// C-callable entry point: start the clipboard socket listener in a detached
++// thread. Safe to call once at kvmagent startup (Aqua/in-session only).
++void dwclip_start_listener(void)
++{
++    pthread_t t;
++    if (pthread_create(&t, NULL, dwclip_listener_thread, NULL) == 0)
++    {
++        pthread_detach(t);
++    }
++}
+diff --git a/meshcore/agentcore.c b/meshcore/agentcore.c
+index fe8228b..afe32cd 100644
+--- a/meshcore/agentcore.c
++++ b/meshcore/agentcore.c
+@@ -922,21 +922,33 @@ ILibTransport_DoneState ILibDuktape_MeshAgent_RemoteDesktop_WriteSink(ILibDuktap
+ #ifdef __APPLE__
+ 	if (((RemoteDesktop_Ptrs*)user)->kvmPipe == NULL)
+ 	{
+-		// Write to AF_UNIX Domain Socket
+-		duk_push_external_buffer(stream->writableStream->ctx);														// [ext]
+-		duk_config_buffer(stream->writableStream->ctx, -1, buffer, (duk_size_t)bufferLen);
+-		duk_push_heapptr(stream->writableStream->ctx, stream->writableStream->obj);									// [ext][rd]
+-		duk_get_prop_string(stream->writableStream->ctx, -1, KVM_IPC_SOCKET);										// [ext][rd][IPC]
+-		duk_get_prop_string(stream->writableStream->ctx, -1, "write");												// [ext][rd][IPC][write]
+-		duk_swap_top(stream->writableStream->ctx, -2);																// [ext][rd][write][this]
+-		duk_push_buffer_object(stream->writableStream->ctx, -4, 0, (duk_size_t)bufferLen, DUK_BUFOBJ_NODEJS_BUFFER);// [ext][rd][write][this][buffer]
+-		if (duk_pcall_method(stream->writableStream->ctx, 1) != 0) { ILibDuktape_Process_UncaughtExceptionEx(stream->writableStream->ctx, "Error Writing Data"); }
+-																													// [ext][rd][ret]
+-		duk_pop_n(stream->writableStream->ctx, 3);																	// ...
++		// kvmPipe not set — only forward if KVM_IPC_SOCKET is present (legacy loginwindow
++		// net.createConnection path). Without the guard, accessing "write" on undefined
++		// throws an uncaught TypeError that drops the KVM session.
++		duk_push_heapptr(stream->writableStream->ctx, stream->writableStream->obj);									// [rd]
++		if (duk_has_prop_string(stream->writableStream->ctx, -1, KVM_IPC_SOCKET))
++		{
++			duk_push_external_buffer(stream->writableStream->ctx);													// [rd][ext]
++			duk_config_buffer(stream->writableStream->ctx, -1, buffer, (duk_size_t)bufferLen);
++			duk_get_prop_string(stream->writableStream->ctx, -2, KVM_IPC_SOCKET);									// [rd][ext][IPC]
++			duk_get_prop_string(stream->writableStream->ctx, -1, "write");											// [rd][ext][IPC][write]
++			duk_swap_top(stream->writableStream->ctx, -2);															// [rd][ext][write][this]
++			duk_push_buffer_object(stream->writableStream->ctx, -3, 0, (duk_size_t)bufferLen, DUK_BUFOBJ_NODEJS_BUFFER);// [rd][ext][write][this][buffer]
++			if (duk_pcall_method(stream->writableStream->ctx, 1) != 0) { ILibDuktape_Process_UncaughtExceptionEx(stream->writableStream->ctx, "Error Writing Data"); }
++			duk_pop_n(stream->writableStream->ctx, 3);																// [rd]
++		}
++		duk_pop(stream->writableStream->ctx);																		// [...]
+ 	}
+ 	else
+ #endif
+ 	{
++		if (bufferLen >= 4)
++		{
++			unsigned short _type = ntohs(((unsigned short*)buffer)[0]);
++			unsigned short _size = ntohs(((unsigned short*)buffer)[1]);
++			FILE *_wf = fopen("/tmp/daemon_writesink.log", "a");
++			if (_wf) { fprintf(_wf, "WriteSink: type=%u size=%u bufferLen=%d\n", _type, _size, bufferLen); fclose(_wf); }
++		}
+ 		kvm_relay_feeddata(buffer, bufferLen);
+ 	}
+ #endif
+@@ -1290,26 +1302,17 @@ duk_ret_t ILibDuktape_MeshAgent_getRemoteDesktop(duk_context *ctx)
+ 	if (duk_peval_string(ctx, "require('user-sessions').consoleUid();") == 0) { console_uid = duk_get_int(ctx, -1); }
+ 	duk_pop(ctx);
+ 	#ifdef __APPLE__
+-		// MacOS
++		// MacOS - both loginwindow (uid=0) and Aqua use the kvmagent LaunchAgent socket.
++		// kvm_relay_setup() connects to /tmp/meshagent-kvm-<uid>.sock and returns the
++		// pipe wrapping that fd. Setting ptrs->kvmPipe causes WriteSink to route all
++		// incoming events (keyboard, mouse) through kvm_relay_feeddata() → the socket,
++		// rather than a JS net socket that was never properly connected for uid=0.
+ 		if (console_uid == 0)
+ 		{
+ 			MeshAgent_sendConsoleText(ctx, "Establishing IPC-x-Connection to LoginWindow for KVM");
+-			char *ipc = (char*)kvm_relay_setup(agent->exePath, agent->pipeManager, ILibDuktape_MeshAgent_RemoteDesktop_KVM_WriteSink, ptrs, console_uid);
+-			duk_eval_string(ctx, "require('net');");														// [rd][net]
+-			duk_get_prop_string(ctx, -1, "createConnection");												// [rd][net][createConnection]
+-			duk_swap_top(ctx, -2);																			// [rd][createConnection][this]
+-			duk_push_object(ctx);																			// [rd][createConnection][this][options]
+-			duk_push_string(ctx, ipc); duk_put_prop_string(ctx, -2, "path");								// [rd][createConnection][this][options]
+-			duk_push_c_function(ctx, ILibDuktape_MeshAgent_getRemoteDesktop_DomainIPC_Sink, DUK_VARARGS);	// [rd][createConnection][this][options][callback]
+-			duk_push_pointer(ctx, ptrs); duk_put_prop_string(ctx, -2, "ptrs");
+-			duk_call_method(ctx, 2);																		// [rd][icpSocket]
+-			duk_put_prop_string(ctx, -2, KVM_IPC_SOCKET);													// [rd]
+-			//ptrs->kvmDomainSocket = (int)(uint64_t)kvm_relay_setup(agent->exePath, agent->pipeManager, ILibDuktape_MeshAgent_RemoteDesktop_KVM_WriteSink, ptrs, console_uid);
+-		}
+-		else
+-		{
+-			ptrs->kvmPipe = kvm_relay_setup(agent->exePath, agent->pipeManager, ILibDuktape_MeshAgent_RemoteDesktop_KVM_WriteSink, ptrs, console_uid);
+ 		}
++		ptrs->kvmPipe = kvm_relay_setup(agent->exePath, agent->pipeManager, ILibDuktape_MeshAgent_RemoteDesktop_KVM_WriteSink, ptrs, console_uid);
++		if (ptrs->kvmPipe == NULL) { MeshAgent_sendConsoleText(ctx, "WARNING: kvm_relay_setup returned NULL (kvmagent socket not reachable)"); }
+ 	#else
+ 		if (TSID != -1) 
+ 		{
+@@ -4510,8 +4513,11 @@ MeshAgentHostContainer* MeshAgent_Create(MeshCommand_AuthInfo_CapabilitiesMask c
+ {
+ 
+ #if defined(_LINKVM) && defined(__APPLE__)
+-    //Before anything, check for permissions (macos requirement)
+-    kvm_check_permission();
++    // Only the per-user kvmagent needs Accessibility/ScreenCapture — it's the
++    // process that actually captures/injects. The root LaunchDaemon has no
++    // GUI session, so requesting a TCC prompt from it (getuid()==0) has
++    // nothing to prompt in and can hang the daemon's main thread indefinitely.
++    if (getuid() != 0) { kvm_check_permission(); }
+ #endif
+ 
+ 
