@@ -1099,6 +1099,25 @@ char* getCurrentSession() {
 // Last known absolute mouse position (for computing relative deltas for HIDUserDevice)
 static double g_lastX = 0, g_lastY = 0;
 
+// Synthesized-mouse state. macOS does NOT derive either of these from the
+// stream of events the way a real HID device would, so we must supply them:
+//   - a drag is a *MouseDragged* event; a MouseMoved while a button is held is
+//     not treated as a drag at all (windows/items never follow the cursor).
+//   - a double/triple click is kCGMouseEventClickState 2/3 on the click events;
+//     two fast MouseDown events are otherwise just two separate single clicks.
+static int    g_btnLeftDown = 0, g_btnRightDown = 0;
+static int    g_clickCount = 0;
+static double g_lastClickTime = 0.0, g_lastClickX = 0.0, g_lastClickY = 0.0;
+#define MOUSE_DBLCLICK_INTERVAL 0.5   // seconds (macOS default double-click speed)
+#define MOUSE_DBLCLICK_SLOP     5.0   // px; clicks must be near-stationary to count
+
+static double mouse_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 void MouseAction(double absX, double absY, int button, short wheel)
 {
     // At the login window, route the mouse through the same screensharingd VNC
@@ -1136,19 +1155,54 @@ void MouseAction(double absX, double absY, int button, short wheel)
 		return;
 	}
 	if (button == 0) {
-		e = CGEventCreateMouseEvent(g_source, kCGEventMouseMoved,
-		    CGPointMake(absX, absY), kCGMouseButtonLeft);
+		// Moves while a button is held must be posted as *MouseDragged*, or macOS
+		// does not treat the gesture as a drag and nothing follows the cursor.
+		CGEventType   mtype = kCGEventMouseMoved;
+		CGMouseButton mbtn  = kCGMouseButtonLeft;
+		if (g_btnLeftDown)       { mtype = kCGEventLeftMouseDragged;  mbtn = kCGMouseButtonLeft;  }
+		else if (g_btnRightDown) { mtype = kCGEventRightMouseDragged; mbtn = kCGMouseButtonRight; }
+		e = CGEventCreateMouseEvent(g_source, mtype, CGPointMake(absX, absY), mbtn);
+		// Drag events carry the click state of the click that started them, so a
+		// double-click-and-drag (e.g. text selection by word) behaves correctly.
+		if (e && mtype != kCGEventMouseMoved) {
+			CGEventSetIntegerValueField(e, kCGMouseEventClickState,
+			    g_clickCount > 0 ? g_clickCount : 1);
+		}
 	} else {
-		CGEventType etype;
+		CGEventType   etype;
+		CGMouseButton mbtn  = kCGMouseButtonLeft;
+		int           isDown = 0;
 		switch (button) {
-			case MOUSEEVENTF_LEFTDOWN:  etype = kCGEventLeftMouseDown;  break;
-			case MOUSEEVENTF_LEFTUP:    etype = kCGEventLeftMouseUp;    break;
-			case MOUSEEVENTF_RIGHTDOWN: etype = kCGEventRightMouseDown; break;
-			case MOUSEEVENTF_RIGHTUP:   etype = kCGEventRightMouseUp;   break;
+			case MOUSEEVENTF_LEFTDOWN:  etype = kCGEventLeftMouseDown;  mbtn = kCGMouseButtonLeft;  isDown = 1; g_btnLeftDown  = 1; break;
+			case MOUSEEVENTF_LEFTUP:    etype = kCGEventLeftMouseUp;    mbtn = kCGMouseButtonLeft;              g_btnLeftDown  = 0; break;
+			case MOUSEEVENTF_RIGHTDOWN: etype = kCGEventRightMouseDown; mbtn = kCGMouseButtonRight; isDown = 1; g_btnRightDown = 1; break;
+			case MOUSEEVENTF_RIGHTUP:   etype = kCGEventRightMouseUp;   mbtn = kCGMouseButtonRight;             g_btnRightDown = 0; break;
 			default: return;
 		}
-		e = CGEventCreateMouseEvent(g_source, etype,
-		    CGPointMake(absX, absY), kCGMouseButtonLeft);
+		if (isDown) {
+			// Advance the click counter when this press is close enough in time and
+			// space to the previous one; otherwise start a new click sequence.
+			double t  = mouse_now();
+			double dx = absX - g_lastClickX;
+			double dy = absY - g_lastClickY;
+			if ((g_clickCount > 0) &&
+			    ((t - g_lastClickTime) <= MOUSE_DBLCLICK_INTERVAL) &&
+			    ((dx * dx + dy * dy) <= (MOUSE_DBLCLICK_SLOP * MOUSE_DBLCLICK_SLOP)))
+			{
+				if (++g_clickCount > 3) { g_clickCount = 1; }  // macOS cycles after triple
+			}
+			else { g_clickCount = 1; }
+			g_lastClickTime = t;
+			g_lastClickX = absX;
+			g_lastClickY = absY;
+		}
+		e = CGEventCreateMouseEvent(g_source, etype, CGPointMake(absX, absY), mbtn);
+		// The matching Up must carry the same click state as its Down, or the
+		// click is not recognised as part of a double/triple click.
+		if (e) {
+			CGEventSetIntegerValueField(e, kCGMouseEventClickState,
+			    g_clickCount > 0 ? g_clickCount : 1);
+		}
 	}
 	if (e) { post_cgevent(e); CFRelease(e); }
 }

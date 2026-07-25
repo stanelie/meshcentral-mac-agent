@@ -125,7 +125,7 @@ index b70a508..d403f67 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..096418c 100644
+index c27e1f0..58f34fc 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
 @@ -2,13 +2,950 @@
@@ -1082,7 +1082,7 @@ index c27e1f0..096418c 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1069,225 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1069,279 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
@@ -1139,6 +1139,25 @@ index c27e1f0..096418c 100644
 +// Last known absolute mouse position (for computing relative deltas for HIDUserDevice)
 +static double g_lastX = 0, g_lastY = 0;
 +
++// Synthesized-mouse state. macOS does NOT derive either of these from the
++// stream of events the way a real HID device would, so we must supply them:
++//   - a drag is a *MouseDragged* event; a MouseMoved while a button is held is
++//     not treated as a drag at all (windows/items never follow the cursor).
++//   - a double/triple click is kCGMouseEventClickState 2/3 on the click events;
++//     two fast MouseDown events are otherwise just two separate single clicks.
++static int    g_btnLeftDown = 0, g_btnRightDown = 0;
++static int    g_clickCount = 0;
++static double g_lastClickTime = 0.0, g_lastClickX = 0.0, g_lastClickY = 0.0;
++#define MOUSE_DBLCLICK_INTERVAL 0.5   // seconds (macOS default double-click speed)
++#define MOUSE_DBLCLICK_SLOP     5.0   // px; clicks must be near-stationary to count
++
++static double mouse_now(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
++}
++
  void MouseAction(double absX, double absY, int button, short wheel)
  {
 -	CGPoint curPos;
@@ -1185,27 +1204,7 @@ index c27e1f0..096418c 100644
 +        vnc_inject_mouse(absX, absY, button, wheel);
 +        return;
 +    }
- 
--		switch (button) {
--			case MOUSEEVENTF_LEFTDOWN:
--				event = kCGEventLeftMouseDown;
--				g_lMouseDown = 1;
--				break;
--			case MOUSEEVENTF_RIGHTDOWN:
--				g_rMouseDown = 1;
--				event = kCGEventRightMouseDown;
--				break;
--			case MOUSEEVENTF_LEFTUP:
--				g_lMouseDown = 0;
--				event = kCGEventLeftMouseUp;
--				break;
--			case MOUSEEVENTF_RIGHTUP:
--				g_rMouseDown = 0;
--				event = kCGEventRightMouseUp;
--				break;
--			default:
--				break;
--		}
++
 +    // Mouse is NOT covered by SecureEventInput, so CGEventPost(kCGHIDEventTap)
 +    // should move the cursor and click at the login window. Fall through to the
 +    // standard CGEvent path below (no special-casing needed for the login screen).
@@ -1225,6 +1224,57 @@ index c27e1f0..096418c 100644
 +        return;
 +    }
  
++	dispatch_once_f(&g_postOnce, NULL, post_init_once);
++	CGEventRef e = NULL;
++	if (wheel != 0) {
++		e = CGEventCreateScrollWheelEvent(g_source, kCGScrollEventUnitLine, 1, (int32_t)wheel);
++		if (e) { post_cgevent(e); CFRelease(e); }
++		return;
++	}
++	if (button == 0) {
++		// Moves while a button is held must be posted as *MouseDragged*, or macOS
++		// does not treat the gesture as a drag and nothing follows the cursor.
++		CGEventType   mtype = kCGEventMouseMoved;
++		CGMouseButton mbtn  = kCGMouseButtonLeft;
++		if (g_btnLeftDown)       { mtype = kCGEventLeftMouseDragged;  mbtn = kCGMouseButtonLeft;  }
++		else if (g_btnRightDown) { mtype = kCGEventRightMouseDragged; mbtn = kCGMouseButtonRight; }
++		e = CGEventCreateMouseEvent(g_source, mtype, CGPointMake(absX, absY), mbtn);
++		// Drag events carry the click state of the click that started them, so a
++		// double-click-and-drag (e.g. text selection by word) behaves correctly.
++		if (e && mtype != kCGEventMouseMoved) {
++			CGEventSetIntegerValueField(e, kCGMouseEventClickState,
++			    g_clickCount > 0 ? g_clickCount : 1);
++		}
++	} else {
++		CGEventType   etype;
++		CGMouseButton mbtn  = kCGMouseButtonLeft;
++		int           isDown = 0;
+ 		switch (button) {
+-			case MOUSEEVENTF_LEFTDOWN:
+-				event = kCGEventLeftMouseDown;
+-				g_lMouseDown = 1;
+-				break;
+-			case MOUSEEVENTF_RIGHTDOWN:
+-				g_rMouseDown = 1;
+-				event = kCGEventRightMouseDown;
+-				break;
+-			case MOUSEEVENTF_LEFTUP:
+-				g_lMouseDown = 0;
+-				event = kCGEventLeftMouseUp;
+-				break;
+-			case MOUSEEVENTF_RIGHTUP:
+-				g_rMouseDown = 0;
+-				event = kCGEventRightMouseUp;
+-				break;
+-			default:
+-				break;
++			case MOUSEEVENTF_LEFTDOWN:  etype = kCGEventLeftMouseDown;  mbtn = kCGMouseButtonLeft;  isDown = 1; g_btnLeftDown  = 1; break;
++			case MOUSEEVENTF_LEFTUP:    etype = kCGEventLeftMouseUp;    mbtn = kCGMouseButtonLeft;              g_btnLeftDown  = 0; break;
++			case MOUSEEVENTF_RIGHTDOWN: etype = kCGEventRightMouseDown; mbtn = kCGMouseButtonRight; isDown = 1; g_btnRightDown = 1; break;
++			case MOUSEEVENTF_RIGHTUP:   etype = kCGEventRightMouseUp;   mbtn = kCGMouseButtonRight;             g_btnRightDown = 0; break;
++			default: return;
+ 		}
+-
 -		if (button == 0x88) 
 -		{
 -			// Double click, this is useful on MacOS.
@@ -1233,40 +1283,42 @@ index c27e1f0..096418c 100644
 -			CGEventPost(kCGHIDEventTap, e);
 -			CGEventSetType(e, kCGEventLeftMouseUp);
 -			CGEventPost(kCGHIDEventTap, e);
--		}
++		if (isDown) {
++			// Advance the click counter when this press is close enough in time and
++			// space to the previous one; otherwise start a new click sequence.
++			double t  = mouse_now();
++			double dx = absX - g_lastClickX;
++			double dy = absY - g_lastClickY;
++			if ((g_clickCount > 0) &&
++			    ((t - g_lastClickTime) <= MOUSE_DBLCLICK_INTERVAL) &&
++			    ((dx * dx + dy * dy) <= (MOUSE_DBLCLICK_SLOP * MOUSE_DBLCLICK_SLOP)))
++			{
++				if (++g_clickCount > 3) { g_clickCount = 1; }  // macOS cycles after triple
++			}
++			else { g_clickCount = 1; }
++			g_lastClickTime = t;
++			g_lastClickX = absX;
++			g_lastClickY = absY;
+ 		}
 -		else
 -		{
 -			e = CGEventCreateMouseEvent(source, event, curPos, 1);
 -			CGEventPost(kCGHIDEventTap, e);
--		}
++		e = CGEventCreateMouseEvent(g_source, etype, CGPointMake(absX, absY), mbtn);
++		// The matching Up must carry the same click state as its Down, or the
++		// click is not recognised as part of a double/triple click.
++		if (e) {
++			CGEventSetIntegerValueField(e, kCGMouseEventClickState,
++			    g_clickCount > 0 ? g_clickCount : 1);
+ 		}
 -		CFRelease(e);
-+	dispatch_once_f(&g_postOnce, NULL, post_init_once);
-+	CGEventRef e = NULL;
-+	if (wheel != 0) {
-+		e = CGEventCreateScrollWheelEvent(g_source, kCGScrollEventUnitLine, 1, (int32_t)wheel);
-+		if (e) { post_cgevent(e); CFRelease(e); }
-+		return;
  	}
 -	else if (wheel != 0)
 -	{
 -		e = CGEventCreateScrollWheelEvent(source, kCGScrollEventUnitPixel, 1, wheel);
 -		CGEventPost(kCGHIDEventTap, e);
 -		CFRelease(e);
-+	if (button == 0) {
-+		e = CGEventCreateMouseEvent(g_source, kCGEventMouseMoved,
-+		    CGPointMake(absX, absY), kCGMouseButtonLeft);
-+	} else {
-+		CGEventType etype;
-+		switch (button) {
-+			case MOUSEEVENTF_LEFTDOWN:  etype = kCGEventLeftMouseDown;  break;
-+			case MOUSEEVENTF_LEFTUP:    etype = kCGEventLeftMouseUp;    break;
-+			case MOUSEEVENTF_RIGHTDOWN: etype = kCGEventRightMouseDown; break;
-+			case MOUSEEVENTF_RIGHTUP:   etype = kCGEventRightMouseUp;   break;
-+			default: return;
-+		}
-+		e = CGEventCreateMouseEvent(g_source, etype,
-+		    CGPointMake(absX, absY), kCGMouseButtonLeft);
- 	}
+-	}
 -	if (source != NULL) CFRelease(source);
 +	if (e) { post_cgevent(e); CFRelease(e); }
  }
@@ -1941,10 +1993,10 @@ index 6d57690..8019f1e 100644
 \ No newline at end of file
 diff --git a/meshcore/KVM/MacOS/mac_kvm_sck.m b/meshcore/KVM/MacOS/mac_kvm_sck.m
 new file mode 100644
-index 0000000..f8e63d8
+index 0000000..cedf5ff
 --- /dev/null
 +++ b/meshcore/KVM/MacOS/mac_kvm_sck.m
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,292 @@
 +/*
 + * ScreenCaptureKit wrapper for MeshAgent KVM.
 + *
@@ -1968,6 +2020,14 @@ index 0000000..f8e63d8
 +    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
 +    fflush(f); fclose(f);
 +}
++
++// SCScreenshotManager is macOS 14+ and is absent from older SDKs entirely (not
++// just unavailable at runtime), so the whole implementation must be compiled out
++// when building against a pre-14 SDK - otherwise the build fails outright on
++// older toolchains. Callers fall back to the CoreGraphics capture path, which is
++// what macOS 11-13 uses anyway.
++#if defined(MAC_OS_VERSION_14_0) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_14_0)
++#define KVM_HAVE_SCK_SDK 1
 +
 +API_AVAILABLE(macos(14.0))
 +static CGImageRef _kvm_sck_capture_impl(uint32_t displayID)
@@ -2036,13 +2096,20 @@ index 0000000..f8e63d8
 +    return result;
 +}
 +
++#endif /* MAC_OS_VERSION_14_0 SDK guard */
++
 +/* C-callable entry point declared in mac_kvm.c */
 +CGImageRef kvm_capture_sck(uint32_t displayID)
 +{
++#ifdef KVM_HAVE_SCK_SDK
 +    if (@available(macOS 14.0, *)) {
 +        return _kvm_sck_capture_impl(displayID);
 +    }
-+    sck_flog("kvm_capture_sck: needs macOS 14+\n");
++    sck_flog("kvm_capture_sck: needs macOS 14+ runtime\n");
++#else
++    (void)displayID;
++    sck_flog("kvm_capture_sck: built against pre-14 SDK, using CoreGraphics path\n");
++#endif
 +    return NULL;
 +}
 +

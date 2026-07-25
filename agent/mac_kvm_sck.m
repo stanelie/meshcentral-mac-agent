@@ -22,6 +22,14 @@ static void sck_flog(const char *fmt, ...) {
     fflush(f); fclose(f);
 }
 
+// SCScreenshotManager is macOS 14+ and is absent from older SDKs entirely (not
+// just unavailable at runtime), so the whole implementation must be compiled out
+// when building against a pre-14 SDK - otherwise the build fails outright on
+// older toolchains. Callers fall back to the CoreGraphics capture path, which is
+// what macOS 11-13 uses anyway.
+#if defined(MAC_OS_VERSION_14_0) && (MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_14_0)
+#define KVM_HAVE_SCK_SDK 1
+
 API_AVAILABLE(macos(14.0))
 static CGImageRef _kvm_sck_capture_impl(uint32_t displayID)
 {
@@ -89,13 +97,20 @@ static CGImageRef _kvm_sck_capture_impl(uint32_t displayID)
     return result;
 }
 
+#endif /* MAC_OS_VERSION_14_0 SDK guard */
+
 /* C-callable entry point declared in mac_kvm.c */
 CGImageRef kvm_capture_sck(uint32_t displayID)
 {
+#ifdef KVM_HAVE_SCK_SDK
     if (@available(macOS 14.0, *)) {
         return _kvm_sck_capture_impl(displayID);
     }
-    sck_flog("kvm_capture_sck: needs macOS 14+\n");
+    sck_flog("kvm_capture_sck: needs macOS 14+ runtime\n");
+#else
+    (void)displayID;
+    sck_flog("kvm_capture_sck: built against pre-14 SDK, using CoreGraphics path\n");
+#endif
     return NULL;
 }
 

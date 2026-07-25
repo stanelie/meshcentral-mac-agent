@@ -37,6 +37,14 @@ codesign -f -s - --identifier meshagent_osx-x86-64 meshagent_osx-x86-64
 > looks permissions up by the code-signing identifier; re-signing without it breaks the
 > Screen Recording grant. Ad-hoc signing (`-s -`) is fine.
 
+> **Build on a macOS 14+ SDK for any target that runs macOS 14+ (e.g. Apple Silicon on
+> Sonoma/Sequoia/Tahoe).** `mac_kvm_sck.m` uses ScreenCaptureKit (`SCScreenshotManager`),
+> which only exists in the macOS 14+ SDK; it is guarded out when built against an older SDK
+> (e.g. an Intel Mac on the macOS 12 CLT), and the agent falls back to the CoreGraphics
+> capture path. That fallback is fine for macOS 11–13 Intel targets, but an arm64 binary
+> built on a pre-14 SDK will lack ScreenCaptureKit and degrade login-window capture on
+> macOS 14+. Build each arch on an SDK ≥ the oldest OS that arch must fully support.
+
 Optional universal binary (agent id 10005):
 ```bash
 lipo -create meshagent_osx-arm-64 meshagent_osx-x86-64 -output meshagent_osx-universal-64
