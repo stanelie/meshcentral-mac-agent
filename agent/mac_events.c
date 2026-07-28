@@ -61,7 +61,15 @@ static IOHIDUserDeviceRef g_kbd_dev  = NULL;
 static IOHIDUserDeviceRef g_mouse_dev = NULL;
 
 // ---- CGEvent fallback globals ----------------------------------------------
-#define POST_MAX_INFLIGHT 16
+// Depth of the in-flight event queue. Mouse moves and (especially) pixel-unit
+// scrolling burst far past the old limit of 16; anything beyond the limit used
+// to be dropped outright, which silently loses input. Losing a *modifier key-up*
+// leaves that modifier stuck for every later keystroke - e.g. a stuck Fn turns
+// 'e' into Fn+E (emoji picker) - and losing ordinary keys corrupts typing. Both
+// symptoms were intermittent because they only occur once the queue overflows.
+#define POST_MAX_INFLIGHT 512
+// Bounded wait before giving up on a slot, so bursts queue instead of vanishing.
+#define POST_WAIT_MS 500
 static dispatch_queue_t     g_postQ;
 static dispatch_semaphore_t g_postSem;
 static dispatch_once_t      g_postOnce;
@@ -492,8 +500,14 @@ static void post_worker(void *arg)
 static void post_cgevent(CGEventRef e)
 {
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
-    if (dispatch_semaphore_wait(g_postSem, DISPATCH_TIME_NOW) != 0) {
-        write(STDOUT_FILENO, "post_cgevent: DROP\n", 19);
+    // Wait briefly for a free slot rather than dropping immediately: input events
+    // must not be silently discarded (see POST_MAX_INFLIGHT). Only give up if the
+    // queue is still saturated after POST_WAIT_MS, and make that visible - the old
+    // STDOUT_FILENO message went to /dev/null under launchd, hiding every drop.
+    if (dispatch_semaphore_wait(g_postSem,
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)POST_WAIT_MS * NSEC_PER_MSEC)) != 0) {
+        FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
+        if (_f) { fprintf(_f, "EVENT-DROPPED (queue saturated %d) t=%ld\n", POST_MAX_INFLIGHT, (long)time(NULL)); fclose(_f); }
         return;
     }
     PostCtx *c = malloc(sizeof(PostCtx));
@@ -1150,7 +1164,16 @@ void MouseAction(double absX, double absY, int button, short wheel)
 	dispatch_once_f(&g_postOnce, NULL, post_init_once);
 	CGEventRef e = NULL;
 	if (wheel != 0) {
-		e = CGEventCreateScrollWheelEvent(g_source, kCGScrollEventUnitLine, 1, (int32_t)wheel);
+		// The viewer sends pixel-like wheel deltas (~9 per trackpad unit, up to a
+		// few hundred on a fast flick) and fires many per gesture. Treating each as
+		// a LINE over-scrolls massively; a per-event line floor still over-scrolls
+		// because of the sheer event count. Use PIXEL units and scale down: smooth,
+		// proportional to actual motion, no floor. TEMP: log raw deltas for tuning.
+		{ FILE*_f=fopen("/tmp/kvm_scroll_debug.log","a"); if(_f){ fprintf(_f,"raw_wheel=%d t=%ld\n",(int)wheel,(long)time(NULL)); fclose(_f);} }
+		int _px = (int)wheel / 3;                          // SCROLL_DIVISOR (tunable)
+		if (_px == 0) _px = (wheel > 0) ? 1 : -1;          // keep tiny scrolls alive
+		if (_px > 160) _px = 160; else if (_px < -160) _px = -160;
+		e = CGEventCreateScrollWheelEvent(g_source, kCGScrollEventUnitPixel, 1, (int32_t)_px);
 		if (e) { post_cgevent(e); CFRelease(e); }
 		return;
 	}
@@ -1230,7 +1253,21 @@ static void inject_key(CGKeyCode keycode, int down)
     if (g_kbd_dev) { hidd_key(keycode, down); return; }
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
     CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, down ? true : false);
-    if (e) { post_cgevent(e); CFRelease(e); }
+    if (e) {
+        // The HIDSystemState source merges the remote Mac's live modifier flags
+        // into synthesized events. A stray Fn (Globe) flag turns e.g. 'e' into
+        // Fn+E (the emoji-picker shortcut) and corrupts other keys invisibly. We
+        // never intend to inject Fn, so strip it. (Diagnostic log to confirm.)
+        CGEventFlags _f = CGEventGetFlags(e);
+        // Silent detector: only record when the stray Fn flag is actually present
+        // (the intermittent condition we're masking). Near-zero overhead otherwise.
+        if (_f & kCGEventFlagMaskSecondaryFn) {
+            char _b[96]; int _l=snprintf(_b,sizeof(_b),"FN-STRIPPED inject_key kc=%d down=%d flags=0x%llx t=%ld\n",(int)keycode,down,(unsigned long long)_f,(long)time(NULL));
+            FILE*_ff=fopen("/tmp/kvm_key_debug.log","a"); if(_ff){fwrite(_b,1,_l,_ff);fclose(_ff);}
+        }
+        CGEventSetFlags(e, _f & ~(CGEventFlags)kCGEventFlagMaskSecondaryFn);
+        post_cgevent(e); CFRelease(e);
+    }
 }
 
 void KeyAction(unsigned char vk, int up)
@@ -1269,6 +1306,7 @@ void KeyAction(unsigned char vk, int up)
 	if (vk == VK_CAPITAL && up) { g_capsLock = g_capsLock ? 0 : 1; }
 
 	{ char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyAction: vk=0x%02x kc=%d up=%d\n", vk, (int)keycode, up); write(STDOUT_FILENO, _b, _l); }
+	{ FILE*_f=fopen("/tmp/kvm_key2_debug.log","a"); if(_f){ fprintf(_f,"KeyAction vk=0x%02x kc=%d up=%d\n",vk,(int)keycode,up); fclose(_f);} }
 	inject_key(keycode, !up);
 }
 
@@ -1319,6 +1357,7 @@ void KeyActionUnicode(uint16_t unicode, int up)
         return;
     }
     { char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyActionUnicode: u=0x%04x vk=0x%02x shift=%d up=%d\n", unicode, vk, need_shift, up); write(STDOUT_FILENO, _b, _l); }
+    { FILE*_f=fopen("/tmp/kvm_key2_debug.log","a"); if(_f){ fprintf(_f,"KeyActionUni u=0x%04x('%c') vk=0x%02x up=%d\n",unicode,(unicode>=32&&unicode<127)?(char)unicode:'?',vk,up); fclose(_f);} }
 
     // For CGEvent, set the unicode on the key event directly using
     // CGEventKeyboardSetUnicodeString — this lets the system handle
@@ -1339,6 +1378,14 @@ void KeyActionUnicode(uint16_t unicode, int up)
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
     CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, up ? false : true);
     if (!e) return;
+    // Strip the inherited Fn flag (see inject_key) so characters like 'e' aren't
+    // interpreted as Fn+E (emoji picker).
+    CGEventFlags _f = CGEventGetFlags(e);
+    if (_f & kCGEventFlagMaskSecondaryFn) {
+        char _b[96]; int _l=snprintf(_b,sizeof(_b),"FN-STRIPPED KeyActionUni u=0x%04x kc=%d up=%d flags=0x%llx t=%ld\n",unicode,(int)keycode,up,(unsigned long long)_f,(long)time(NULL));
+        FILE*_ff=fopen("/tmp/kvm_key_debug.log","a"); if(_ff){fwrite(_b,1,_l,_ff);fclose(_ff);}
+    }
+    CGEventSetFlags(e, _f & ~(CGEventFlags)kCGEventFlagMaskSecondaryFn);
     // Override the character produced by this key event with the Unicode value
     UniChar uc = (UniChar)unicode;
     CGEventKeyboardSetUnicodeString(e, 1, &uc);
