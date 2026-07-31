@@ -32,6 +32,7 @@ limitations under the License.
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <poll.h>
 
 #include <string.h>
 #include <pwd.h>
@@ -560,6 +561,34 @@ void* kvm_mainloopinput(void* param)
 		}
 
 		KvmDebugLog("Reading from master in kvm_mainloopinput\n");
+		if (KVM_AGENT_FD != -1 && KVM_Listener_FD != -1)
+		{
+			// A stale connection (daemon end left open — e.g. a browser tab closed
+			// without a clean disconnect) can sit on KVM_AGENT_FD forever without
+			// ever hitting EOF, which starves the listener: the backlog holds any
+			// new session's connect() attempt indefinitely, since accept() below
+			// only runs after THIS read detects EOF. Poll both fds instead of just
+			// reading, so a pending new connection can evict the stale one rather
+			// than queue behind it — last connect wins.
+			struct pollfd pfds[2];
+			pfds[0].fd = KVM_AGENT_FD;    pfds[0].events = POLLIN;
+			pfds[1].fd = KVM_Listener_FD; pfds[1].events = POLLIN;
+			int pr = poll(pfds, 2, -1);
+			if (pr > 0 && (pfds[1].revents & POLLIN))
+			{
+				int newfd = accept(KVM_Listener_FD, NULL, NULL);
+				if (newfd >= 0)
+				{
+					kvm_flog("EVICT stale kvm connection fd=%d for new fd=%d\n", KVM_AGENT_FD, newfd);
+					close(KVM_AGENT_FD);
+					KVM_AGENT_FD = newfd;
+					SCREEN_HEIGHT = SCREEN_WIDTH = 0; // force a clean reinit for the new viewer
+					len = 0; ptr = 0;                 // discard any partial buffer from the old connection
+					continue;
+				}
+			}
+			if (!(pr > 0 && (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)))) { continue; }
+		}
 		cbBytesRead = read(KVM_AGENT_FD == -1 ? STDIN_FILENO: KVM_AGENT_FD, pchRequest2 + len, 30000 - len);
 		KvmDebugLog("Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
 

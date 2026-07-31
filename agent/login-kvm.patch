@@ -125,10 +125,10 @@ index b70a508..d403f67 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..906bffa 100644
+index c27e1f0..8b7ba5a 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,964 @@
+@@ -2,13 +2,998 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -192,6 +192,40 @@ index c27e1f0..906bffa 100644
 +static IOHIDUserDeviceRef g_mouse_dev = NULL;
 +
 +// ---- CGEvent fallback globals ----------------------------------------------
++// Flags that CGEventSourceCreate(kCGEventSourceStateHIDSystemState) merges into
++// every synthesized event from the machine's live HID state, but that we never
++// intend to inject. Both have been observed stuck ON on a real Mac and both
++// silently corrupt ordinary typing:
++//   SecondaryFn - a stray Fn (Globe) turns 'e' into Fn+E (emoji picker).
++//   NumericPad  - makes the system read the keystroke with *keypad* semantics,
++//                 where the decimal-separator key yields '.', so an injected
++//                 ',' arrives as '.'. Invisible to UCKeyTranslate, which does
++//                 not model this flag - the event itself carries a correct ','
++//                 right up to CGEventPost, and is reinterpreted after that.
++// Real modifiers (shift/ctrl/opt/cmd) are deliberately NOT stripped: those are
++// injected as genuine modifier key events and must stay merged for shortcuts.
++#define KVM_STRAY_FLAGS ((CGEventFlags)(kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad))
++
++// Strip the stray flags, and record it when there was actually something to
++// strip. The condition is intermittent (the flags stick and unstick with HID
++// state), so this detector is what tells us the fix is doing real work rather
++// than the flags merely happening to be clear. Costs nothing when they are.
++static void kvm_strip_stray_flags(CGEventRef e, const char *where, int keycode)
++{
++    CGEventFlags f = CGEventGetFlags(e);
++    if (f & KVM_STRAY_FLAGS) {
++        char b[160];
++        int l = snprintf(b, sizeof(b),
++            "STRAY-FLAGS-STRIPPED %s kc=%d flags=0x%llx fn=%d numpad=%d t=%ld\n",
++            where, keycode, (unsigned long long)f,
++            (f & kCGEventFlagMaskSecondaryFn) ? 1 : 0,
++            (f & kCGEventFlagMaskNumericPad) ? 1 : 0, (long)time(NULL));
++        FILE *ff = fopen("/tmp/kvm_key_debug.log", "a");
++        if (ff) { fwrite(b, 1, l, ff); fclose(ff); }
++    }
++    CGEventSetFlags(e, f & ~KVM_STRAY_FLAGS);
++}
++
 +// Depth of the in-flight event queue. Mouse moves and (especially) pixel-unit
 +// scrolling burst far past the old limit of 16; anything beyond the limit used
 +// to be dropped outright, which silently loses input. Losing a *modifier key-up*
@@ -1096,7 +1130,7 @@ index c27e1f0..906bffa 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1083,312 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1117,294 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
@@ -1218,7 +1252,7 @@ index c27e1f0..906bffa 100644
 +        vnc_inject_mouse(absX, absY, button, wheel);
 +        return;
 +    }
- 
++
 +    // Mouse is NOT covered by SecureEventInput, so CGEventPost(kCGHIDEventTap)
 +    // should move the cursor and click at the login window. Fall through to the
 +    // standard CGEvent path below (no special-casing needed for the login screen).
@@ -1237,7 +1271,7 @@ index c27e1f0..906bffa 100644
 +            (uint8_t*)&r, sizeof(r));
 +        return;
 +    }
-+
+ 
 +	dispatch_once_f(&g_postOnce, NULL, post_init_once);
 +	CGEventRef e = NULL;
 +	if (wheel != 0) {
@@ -1246,7 +1280,6 @@ index c27e1f0..906bffa 100644
 +		// a LINE over-scrolls massively; a per-event line floor still over-scrolls
 +		// because of the sheer event count. Use PIXEL units and scale down: smooth,
 +		// proportional to actual motion, no floor. TEMP: log raw deltas for tuning.
-+		{ FILE*_f=fopen("/tmp/kvm_scroll_debug.log","a"); if(_f){ fprintf(_f,"raw_wheel=%d t=%ld\n",(int)wheel,(long)time(NULL)); fclose(_f);} }
 +		int _px = (int)wheel / 3;                          // SCROLL_DIVISOR (tunable)
 +		if (_px == 0) _px = (wheel > 0) ? 1 : -1;          // keep tiny scrolls alive
 +		if (_px > 160) _px = 160; else if (_px < -160) _px = -160;
@@ -1335,13 +1368,13 @@ index c27e1f0..906bffa 100644
 +			    g_clickCount > 0 ? g_clickCount : 1);
  		}
 -		CFRelease(e);
--	}
+ 	}
 -	else if (wheel != 0)
 -	{
 -		e = CGEventCreateScrollWheelEvent(source, kCGScrollEventUnitPixel, 1, wheel);
 -		CGEventPost(kCGHIDEventTap, e);
 -		CFRelease(e);
- 	}
+-	}
 -	if (source != NULL) CFRelease(source);
 +	if (e) { post_cgevent(e); CFRelease(e); }
  }
@@ -1371,18 +1404,8 @@ index c27e1f0..906bffa 100644
 +    dispatch_once_f(&g_postOnce, NULL, post_init_once);
 +    CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, down ? true : false);
 +    if (e) {
-+        // The HIDSystemState source merges the remote Mac's live modifier flags
-+        // into synthesized events. A stray Fn (Globe) flag turns e.g. 'e' into
-+        // Fn+E (the emoji-picker shortcut) and corrupts other keys invisibly. We
-+        // never intend to inject Fn, so strip it. (Diagnostic log to confirm.)
-+        CGEventFlags _f = CGEventGetFlags(e);
-+        // Silent detector: only record when the stray Fn flag is actually present
-+        // (the intermittent condition we're masking). Near-zero overhead otherwise.
-+        if (_f & kCGEventFlagMaskSecondaryFn) {
-+            char _b[96]; int _l=snprintf(_b,sizeof(_b),"FN-STRIPPED inject_key kc=%d down=%d flags=0x%llx t=%ld\n",(int)keycode,down,(unsigned long long)_f,(long)time(NULL));
-+            FILE*_ff=fopen("/tmp/kvm_key_debug.log","a"); if(_ff){fwrite(_b,1,_l,_ff);fclose(_ff);}
-+        }
-+        CGEventSetFlags(e, _f & ~(CGEventFlags)kCGEventFlagMaskSecondaryFn);
++        // Drop the stray HID-state flags this event inherited (see KVM_STRAY_FLAGS).
++        kvm_strip_stray_flags(e, "inject_key", (int)keycode);
 +        post_cgevent(e); CFRelease(e);
 +    }
 +}
@@ -1456,7 +1479,6 @@ index c27e1f0..906bffa 100644
 -	CGEventPost(kCGHIDEventTap, key);
 -	CFRelease(key);
 +	{ char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyAction: vk=0x%02x kc=%d up=%d\n", vk, (int)keycode, up); write(STDOUT_FILENO, _b, _l); }
-+	{ FILE*_f=fopen("/tmp/kvm_key2_debug.log","a"); if(_f){ fprintf(_f,"KeyAction vk=0x%02x kc=%d up=%d\n",vk,(int)keycode,up); fclose(_f);} }
 +	inject_key(keycode, !up);
 +}
  
@@ -1516,7 +1538,6 @@ index c27e1f0..906bffa 100644
 +        return;
 +    }
 +    { char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyActionUnicode: u=0x%04x vk=0x%02x shift=%d up=%d\n", unicode, vk, need_shift, up); write(STDOUT_FILENO, _b, _l); }
-+    { FILE*_f=fopen("/tmp/kvm_key2_debug.log","a"); if(_f){ fprintf(_f,"KeyActionUni u=0x%04x('%c') vk=0x%02x up=%d\n",unicode,(unicode>=32&&unicode<127)?(char)unicode:'?',vk,up); fclose(_f);} }
 +
 +    // For CGEvent, set the unicode on the key event directly using
 +    // CGEventKeyboardSetUnicodeString — this lets the system handle
@@ -1537,14 +1558,9 @@ index c27e1f0..906bffa 100644
 +    dispatch_once_f(&g_postOnce, NULL, post_init_once);
 +    CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, up ? false : true);
 +    if (!e) return;
-+    // Strip the inherited Fn flag (see inject_key) so characters like 'e' aren't
-+    // interpreted as Fn+E (emoji picker).
-+    CGEventFlags _f = CGEventGetFlags(e);
-+    if (_f & kCGEventFlagMaskSecondaryFn) {
-+        char _b[96]; int _l=snprintf(_b,sizeof(_b),"FN-STRIPPED KeyActionUni u=0x%04x kc=%d up=%d flags=0x%llx t=%ld\n",unicode,(int)keycode,up,(unsigned long long)_f,(long)time(NULL));
-+        FILE*_ff=fopen("/tmp/kvm_key_debug.log","a"); if(_ff){fwrite(_b,1,_l,_ff);fclose(_ff);}
-+    }
-+    CGEventSetFlags(e, _f & ~(CGEventFlags)kCGEventFlagMaskSecondaryFn);
++    // Drop the stray HID-state flags this event inherited (see KVM_STRAY_FLAGS).
++    // NumericPad in particular made an injected ',' arrive as '.'.
++    kvm_strip_stray_flags(e, "KeyActionUnicode", (int)keycode);
 +    // Override the character produced by this key event with the Unicode value
 +    UniChar uc = (UniChar)unicode;
 +    CGEventKeyboardSetUnicodeString(e, 1, &uc);
@@ -1552,7 +1568,7 @@ index c27e1f0..906bffa 100644
 +    CFRelease(e);
  }
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..8019f1e 100644
+index 6d57690..85da94b 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -1563,7 +1579,11 @@ index 6d57690..8019f1e 100644
  #include "../../meshdefines.h"
  #include "../../meshinfo.h"
  #include "../../../microstack/ILibParsers.h"
-@@ -34,6 +35,16 @@ limitations under the License.
+@@ -31,9 +32,20 @@ limitations under the License.
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #include <sys/un.h>
++#include <poll.h>
  
  #include <string.h>
  #include <pwd.h>
@@ -1580,7 +1600,7 @@ index 6d57690..8019f1e 100644
  
  int KVM_Listener_FD = -1;
  // Socket path used when kvm_server_mainloop runs in socket-listener
-@@ -289,8 +300,22 @@ int kvm_init()
+@@ -289,8 +301,22 @@ int kvm_init()
  {
  	ILibCriticalLogFilename = "KVMSlave.log";
  	int old_height_count = TILE_HEIGHT_COUNT;
@@ -1604,7 +1624,7 @@ index 6d57690..8019f1e 100644
  	
  	if (SCREEN_WIDTH > 0)
  	{
-@@ -299,8 +324,23 @@ int kvm_init()
+@@ -299,8 +325,23 @@ int kvm_init()
  		CGDisplayModeRelease(mode);
  	}
  
@@ -1628,7 +1648,7 @@ index 6d57690..8019f1e 100644
  	// Some magic numbers.
  	TILE_WIDTH = 32;
  	TILE_HEIGHT = 32;
-@@ -312,13 +352,20 @@ int kvm_init()
+@@ -312,13 +353,20 @@ int kvm_init()
  	if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
  	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
  	
@@ -1651,7 +1671,7 @@ index 6d57690..8019f1e 100644
  
  	// Write the reply to the pipe.
  	ILibQueue_Lock(g_messageQ);
-@@ -341,6 +388,12 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -341,6 +389,12 @@ int kvm_server_inputdata(char* block, int blocklen)
  	type = ntohs(((unsigned short*)(block))[0]);
  	size = ntohs(((unsigned short*)(block))[1]);
  
@@ -1664,7 +1684,7 @@ index 6d57690..8019f1e 100644
  	if (size > blocklen) return 0;
  
  	switch (type)
-@@ -484,7 +537,7 @@ void* kvm_mainloopinput(void* param)
+@@ -484,7 +538,7 @@ void* kvm_mainloopinput(void* param)
  	int ptr = 0;
  	int ptr2 = 0;
  	int len = 0;
@@ -1673,7 +1693,42 @@ index 6d57690..8019f1e 100644
  	int cbBytesRead = 0;
  
  	char tmp[255];
-@@ -539,7 +592,7 @@ void* kvm_mainloopinput(void* param)
+@@ -507,6 +561,34 @@ void* kvm_mainloopinput(void* param)
+ 		}
+ 
+ 		KvmDebugLog("Reading from master in kvm_mainloopinput\n");
++		if (KVM_AGENT_FD != -1 && KVM_Listener_FD != -1)
++		{
++			// A stale connection (daemon end left open — e.g. a browser tab closed
++			// without a clean disconnect) can sit on KVM_AGENT_FD forever without
++			// ever hitting EOF, which starves the listener: the backlog holds any
++			// new session's connect() attempt indefinitely, since accept() below
++			// only runs after THIS read detects EOF. Poll both fds instead of just
++			// reading, so a pending new connection can evict the stale one rather
++			// than queue behind it — last connect wins.
++			struct pollfd pfds[2];
++			pfds[0].fd = KVM_AGENT_FD;    pfds[0].events = POLLIN;
++			pfds[1].fd = KVM_Listener_FD; pfds[1].events = POLLIN;
++			int pr = poll(pfds, 2, -1);
++			if (pr > 0 && (pfds[1].revents & POLLIN))
++			{
++				int newfd = accept(KVM_Listener_FD, NULL, NULL);
++				if (newfd >= 0)
++				{
++					kvm_flog("EVICT stale kvm connection fd=%d for new fd=%d\n", KVM_AGENT_FD, newfd);
++					close(KVM_AGENT_FD);
++					KVM_AGENT_FD = newfd;
++					SCREEN_HEIGHT = SCREEN_WIDTH = 0; // force a clean reinit for the new viewer
++					len = 0; ptr = 0;                 // discard any partial buffer from the old connection
++					continue;
++				}
++			}
++			if (!(pr > 0 && (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)))) { continue; }
++		}
+ 		cbBytesRead = read(KVM_AGENT_FD == -1 ? STDIN_FILENO: KVM_AGENT_FD, pchRequest2 + len, 30000 - len);
+ 		KvmDebugLog("Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
+ 
+@@ -539,7 +621,7 @@ void* kvm_mainloopinput(void* param)
  			write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
  		}
@@ -1682,7 +1737,7 @@ index 6d57690..8019f1e 100644
  
  		if (KVM_AGENT_FD != -1)
  		{
-@@ -549,7 +602,7 @@ void* kvm_mainloopinput(void* param)
+@@ -549,7 +631,7 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		if (ptr == len) { len = 0; ptr = 0; }
@@ -1691,7 +1746,7 @@ index 6d57690..8019f1e 100644
  	}
  
  	return 0;
-@@ -557,16 +610,11 @@ void* kvm_mainloopinput(void* param)
+@@ -557,16 +639,11 @@ void* kvm_mainloopinput(void* param)
  void ExitSink(int s)
  {
  	UNREFERENCED_PARAMETER(s);
@@ -1713,7 +1768,7 @@ index 6d57690..8019f1e 100644
  }
  void* kvm_server_mainloop(void* param)
  {
-@@ -637,6 +685,7 @@ void* kvm_server_mainloop(void* param)
+@@ -637,6 +714,7 @@ void* kvm_server_mainloop(void* param)
  		{
  			written = write(STDOUT_FILENO, "ACCEPT ERROR ON DOMAIN SOCKET", 29);
  			fsync(STDOUT_FILENO);
@@ -1721,7 +1776,7 @@ index 6d57690..8019f1e 100644
  			return(NULL);
  		}
  		else
-@@ -645,12 +694,15 @@ void* kvm_server_mainloop(void* param)
+@@ -645,12 +723,15 @@ void* kvm_server_mainloop(void* param)
  			int tmpLen = sprintf_s(tmp, sizeof(tmp), "ACCEPTed new connection %d on Domain Socket\n", KVM_AGENT_FD);
  			written = write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
@@ -1739,7 +1794,7 @@ index 6d57690..8019f1e 100644
  
  
  	g_shutdown = 0;
-@@ -724,9 +776,11 @@ void* kvm_server_mainloop(void* param)
+@@ -724,9 +805,11 @@ void* kvm_server_mainloop(void* param)
  		}
  
  		screen_num = CGMainDisplayID();
@@ -1753,7 +1808,7 @@ index 6d57690..8019f1e 100644
  		if (SCREEN_SCALE_SET == 0)
  		{
  			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
-@@ -741,19 +795,143 @@ void* kvm_server_mainloop(void* param)
+@@ -741,19 +824,143 @@ void* kvm_server_mainloop(void* param)
  		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
  		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
  		
@@ -1774,9 +1829,7 @@ index 6d57690..8019f1e 100644
 +		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 +		CGImageRef image = NULL;
 +		if (getuid() == 0)
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
 +			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
 +			// back to the standard CoreGraphics capture APIs: on a PHYSICAL Mac (not
@@ -1799,7 +1852,9 @@ index 6d57690..8019f1e 100644
 +			}
 +		}
 +		else
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
 +			// display directly instead of compositing the window list, and measured
 +			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
@@ -1903,7 +1958,7 @@ index 6d57690..8019f1e 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1166,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1195,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -1929,7 +1984,7 @@ index 6d57690..8019f1e 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1247,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1276,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -1991,7 +2046,7 @@ index 6d57690..8019f1e 100644
  	}
  }
  
-@@ -1190,4 +1412,45 @@ void kvm_check_permission()
+@@ -1190,4 +1441,45 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

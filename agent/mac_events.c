@@ -61,6 +61,40 @@ static IOHIDUserDeviceRef g_kbd_dev  = NULL;
 static IOHIDUserDeviceRef g_mouse_dev = NULL;
 
 // ---- CGEvent fallback globals ----------------------------------------------
+// Flags that CGEventSourceCreate(kCGEventSourceStateHIDSystemState) merges into
+// every synthesized event from the machine's live HID state, but that we never
+// intend to inject. Both have been observed stuck ON on a real Mac and both
+// silently corrupt ordinary typing:
+//   SecondaryFn - a stray Fn (Globe) turns 'e' into Fn+E (emoji picker).
+//   NumericPad  - makes the system read the keystroke with *keypad* semantics,
+//                 where the decimal-separator key yields '.', so an injected
+//                 ',' arrives as '.'. Invisible to UCKeyTranslate, which does
+//                 not model this flag - the event itself carries a correct ','
+//                 right up to CGEventPost, and is reinterpreted after that.
+// Real modifiers (shift/ctrl/opt/cmd) are deliberately NOT stripped: those are
+// injected as genuine modifier key events and must stay merged for shortcuts.
+#define KVM_STRAY_FLAGS ((CGEventFlags)(kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad))
+
+// Strip the stray flags, and record it when there was actually something to
+// strip. The condition is intermittent (the flags stick and unstick with HID
+// state), so this detector is what tells us the fix is doing real work rather
+// than the flags merely happening to be clear. Costs nothing when they are.
+static void kvm_strip_stray_flags(CGEventRef e, const char *where, int keycode)
+{
+    CGEventFlags f = CGEventGetFlags(e);
+    if (f & KVM_STRAY_FLAGS) {
+        char b[160];
+        int l = snprintf(b, sizeof(b),
+            "STRAY-FLAGS-STRIPPED %s kc=%d flags=0x%llx fn=%d numpad=%d t=%ld\n",
+            where, keycode, (unsigned long long)f,
+            (f & kCGEventFlagMaskSecondaryFn) ? 1 : 0,
+            (f & kCGEventFlagMaskNumericPad) ? 1 : 0, (long)time(NULL));
+        FILE *ff = fopen("/tmp/kvm_key_debug.log", "a");
+        if (ff) { fwrite(b, 1, l, ff); fclose(ff); }
+    }
+    CGEventSetFlags(e, f & ~KVM_STRAY_FLAGS);
+}
+
 // Depth of the in-flight event queue. Mouse moves and (especially) pixel-unit
 // scrolling burst far past the old limit of 16; anything beyond the limit used
 // to be dropped outright, which silently loses input. Losing a *modifier key-up*
@@ -1169,7 +1203,6 @@ void MouseAction(double absX, double absY, int button, short wheel)
 		// a LINE over-scrolls massively; a per-event line floor still over-scrolls
 		// because of the sheer event count. Use PIXEL units and scale down: smooth,
 		// proportional to actual motion, no floor. TEMP: log raw deltas for tuning.
-		{ FILE*_f=fopen("/tmp/kvm_scroll_debug.log","a"); if(_f){ fprintf(_f,"raw_wheel=%d t=%ld\n",(int)wheel,(long)time(NULL)); fclose(_f);} }
 		int _px = (int)wheel / 3;                          // SCROLL_DIVISOR (tunable)
 		if (_px == 0) _px = (wheel > 0) ? 1 : -1;          // keep tiny scrolls alive
 		if (_px > 160) _px = 160; else if (_px < -160) _px = -160;
@@ -1254,18 +1287,8 @@ static void inject_key(CGKeyCode keycode, int down)
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
     CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, down ? true : false);
     if (e) {
-        // The HIDSystemState source merges the remote Mac's live modifier flags
-        // into synthesized events. A stray Fn (Globe) flag turns e.g. 'e' into
-        // Fn+E (the emoji-picker shortcut) and corrupts other keys invisibly. We
-        // never intend to inject Fn, so strip it. (Diagnostic log to confirm.)
-        CGEventFlags _f = CGEventGetFlags(e);
-        // Silent detector: only record when the stray Fn flag is actually present
-        // (the intermittent condition we're masking). Near-zero overhead otherwise.
-        if (_f & kCGEventFlagMaskSecondaryFn) {
-            char _b[96]; int _l=snprintf(_b,sizeof(_b),"FN-STRIPPED inject_key kc=%d down=%d flags=0x%llx t=%ld\n",(int)keycode,down,(unsigned long long)_f,(long)time(NULL));
-            FILE*_ff=fopen("/tmp/kvm_key_debug.log","a"); if(_ff){fwrite(_b,1,_l,_ff);fclose(_ff);}
-        }
-        CGEventSetFlags(e, _f & ~(CGEventFlags)kCGEventFlagMaskSecondaryFn);
+        // Drop the stray HID-state flags this event inherited (see KVM_STRAY_FLAGS).
+        kvm_strip_stray_flags(e, "inject_key", (int)keycode);
         post_cgevent(e); CFRelease(e);
     }
 }
@@ -1306,7 +1329,6 @@ void KeyAction(unsigned char vk, int up)
 	if (vk == VK_CAPITAL && up) { g_capsLock = g_capsLock ? 0 : 1; }
 
 	{ char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyAction: vk=0x%02x kc=%d up=%d\n", vk, (int)keycode, up); write(STDOUT_FILENO, _b, _l); }
-	{ FILE*_f=fopen("/tmp/kvm_key2_debug.log","a"); if(_f){ fprintf(_f,"KeyAction vk=0x%02x kc=%d up=%d\n",vk,(int)keycode,up); fclose(_f);} }
 	inject_key(keycode, !up);
 }
 
@@ -1357,7 +1379,6 @@ void KeyActionUnicode(uint16_t unicode, int up)
         return;
     }
     { char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyActionUnicode: u=0x%04x vk=0x%02x shift=%d up=%d\n", unicode, vk, need_shift, up); write(STDOUT_FILENO, _b, _l); }
-    { FILE*_f=fopen("/tmp/kvm_key2_debug.log","a"); if(_f){ fprintf(_f,"KeyActionUni u=0x%04x('%c') vk=0x%02x up=%d\n",unicode,(unicode>=32&&unicode<127)?(char)unicode:'?',vk,up); fclose(_f);} }
 
     // For CGEvent, set the unicode on the key event directly using
     // CGEventKeyboardSetUnicodeString — this lets the system handle
@@ -1378,14 +1399,9 @@ void KeyActionUnicode(uint16_t unicode, int up)
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
     CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, up ? false : true);
     if (!e) return;
-    // Strip the inherited Fn flag (see inject_key) so characters like 'e' aren't
-    // interpreted as Fn+E (emoji picker).
-    CGEventFlags _f = CGEventGetFlags(e);
-    if (_f & kCGEventFlagMaskSecondaryFn) {
-        char _b[96]; int _l=snprintf(_b,sizeof(_b),"FN-STRIPPED KeyActionUni u=0x%04x kc=%d up=%d flags=0x%llx t=%ld\n",unicode,(int)keycode,up,(unsigned long long)_f,(long)time(NULL));
-        FILE*_ff=fopen("/tmp/kvm_key_debug.log","a"); if(_ff){fwrite(_b,1,_l,_ff);fclose(_ff);}
-    }
-    CGEventSetFlags(e, _f & ~(CGEventFlags)kCGEventFlagMaskSecondaryFn);
+    // Drop the stray HID-state flags this event inherited (see KVM_STRAY_FLAGS).
+    // NumericPad in particular made an injected ',' arrive as '.'.
+    kvm_strip_stray_flags(e, "KeyActionUnicode", (int)keycode);
     // Override the character produced by this key event with the Unicode value
     UniChar uc = (UniChar)unicode;
     CGEventKeyboardSetUnicodeString(e, 1, &uc);
