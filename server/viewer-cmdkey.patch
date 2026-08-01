@@ -1,0 +1,39 @@
+--- agent-desktop-0.0.2.js.bak-20260801-081028	2026-06-24 11:59:43.548901078 -0400
++++ agent-desktop-0.0.2.js	2026-08-01 08:36:08.268817055 -0400
+@@ -435,7 +435,8 @@
+             var kc = event.keyCode;
+             if (kc == 0x3B) { kc = 0xBA; } // Fix the ';' key
+             else if (kc == 173) { kc = 189; } // Fix the '-' key for Firefox
+-            else if (kc == 61) { kc = 187; } // Fix the '=' key for Firefox
++            else if (kc == 61) { kc = 187; } // Fix the '=' key for Firefox
++            else if (kc == 224) { kc = 91; } // Fix the Meta/Command key for Firefox
+             obj.SendKeyMsgKC(action, kc, extendedKey);
+         }
+     }
+@@ -641,7 +642,7 @@
+     obj.xxMouseWheel = function (e) { if (obj.State == 3) { obj.SendMouseMsg(obj.KeyAction.SCROLL, e); return false; } return true; }
+     obj.xxKeyUp = function (e) {
+         if ((e.key != 'Dead') && (obj.State == 3)) {
+-            if ((typeof e.key == 'string') && (e.key.length == 1) && (e.ctrlKey != true) && (e.altKey != true) && (obj.remoteKeyMap == false)) {
++            if ((typeof e.key == 'string') && (e.key.length == 1) && (e.ctrlKey != true) && (e.altKey != true) && (e.metaKey != true) && (obj.remoteKeyMap == false)) {
+                 obj.SendKeyUnicode(obj.KeyAction.UP, e.key.charCodeAt(0));
+             } else {
+                 obj.SendKeyMsg(obj.KeyAction.UP, e);
+@@ -651,7 +652,7 @@
+     }
+     obj.xxKeyDown = function (e) {
+         if ((e.key != 'Dead') && (obj.State == 3)) {
+-            if (!((typeof e.key == 'string') && (e.key.length == 1) && (e.ctrlKey != true) && (e.altKey != true) && (obj.remoteKeyMap == false))) {
++            if (!((typeof e.key == 'string') && (e.key.length == 1) && (e.ctrlKey != true) && (e.altKey != true) && (e.metaKey != true) && (obj.remoteKeyMap == false))) {
+                 obj.SendKeyMsg(obj.KeyAction.DOWN, e);
+                 if (e.preventDefault) e.preventDefault(); if (e.stopPropagation) e.stopPropagation(); return false;
+             }
+@@ -659,7 +660,7 @@
+     }
+     obj.xxKeyPress = function (e) {
+         if ((e.key != 'Dead') && (obj.State == 3)) {
+-            if ((typeof e.key == 'string') && (e.key.length == 1) && (e.ctrlKey != true) && (e.altKey != true) && (obj.remoteKeyMap == false)) {
++            if ((typeof e.key == 'string') && (e.key.length == 1) && (e.ctrlKey != true) && (e.altKey != true) && (e.metaKey != true) && (obj.remoteKeyMap == false)) {
+                 obj.SendKeyUnicode(obj.KeyAction.DOWN, e.key.charCodeAt(0));
+             } // else { obj.SendKeyMsg(obj.KeyAction.DOWN, e); }
+         }

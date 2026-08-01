@@ -1,8 +1,8 @@
 # MeshCentral server deployment
 
-Nothing in MeshCentral's own code is patched. The server side is two sets of **files** placed
-into the MeshCentral install, both of which must be **re-applied after a MeshCentral `npm`
-update** (an update overwrites them).
+The server side is two sets of **files** placed into the MeshCentral install, plus **one patch
+to MeshCentral's own viewer code** (see §3). All three must be **re-applied after a MeshCentral
+`npm` update** (an update overwrites them).
 
 Set `MC` to your MeshCentral install root (the directory that contains
 `node_modules/meshcentral`), e.g.:
@@ -63,6 +63,47 @@ Resulting public URLs (`https://<host>/meshsetup/…`): `meshinstall.sh`,
 > down. The `public/` folder is the safe, side-effect-free location. After any server change,
 > verify the web UI (root + login return HTTP 200) before walking away.
 
+## 3. Viewer patch — Cmd+C / Cmd+V on macOS remotes (`viewer-cmdkey.patch`)
+
+Without this, **no Cmd shortcut works** on a macOS remote: Cmd+C types a bare `c`, or nothing
+at all. Two independent upstream MeshCentral bugs, both in
+`public/scripts/agent-desktop-0.0.2.js`:
+
+1. **`metaKey` missing from the modifier check** (broke *every* browser). `xxKeyUp`,
+   `xxKeyDown` and `xxKeyPress` tested `(e.ctrlKey != true) && (e.altKey != true)` but not
+   `metaKey`. With Cmd held, the letter was treated as ordinary text and routed to the unicode
+   path — which depends on the browser's `keypress` event, and **macOS browsers do not fire
+   `keypress` while Cmd is held**. The letter vanished; only the modifier arrived.
+
+2. **Firefox reports `keyCode 224` for Command; Chrome reports `91`** (broke Firefox only).
+   `obj.localKeyMap = true` is the default, so the `(obj.localKeyMap == false)` guard is always
+   false and the `e.code` lookup table — which correctly maps `"MetaLeft": 91` — is **dead code
+   for everyone**. Every key falls through to the legacy `event.keyCode` branch, where Firefox's
+   224 was unmapped and silently dropped. Fixed by one more entry in the file's existing
+   Firefox-fixup chain.
+
+Because that `e.code` table is dead, **any other Firefox keyCode divergence will fail the same
+way** — that fixup chain is where to add it.
+
+```bash
+cd "$MC/public/scripts"
+cp -p agent-desktop-0.0.2.js "agent-desktop-0.0.2.js.bak-$(date +%Y%m%d-%H%M%S)"
+patch -p0 < /path/to/server/viewer-cmdkey.patch
+node --check agent-desktop-0.0.2.js && echo SYNTAX OK
+```
+
+Then hard-refresh the browser (Cmd+Shift+R) — it's a static script, so no restart is needed.
+Verify in **both** Chrome and Firefox; they failed for different reasons and one working does
+not imply the other does.
+
+> Only applies when `minify` is disabled in `config.json` (`"_minify"` with the underscore
+> prefix = disabled, which is the default). If minify is ever enabled, the server serves
+> `agent-desktop-0.0.2-min.js` instead and this patch becomes inert — the min file would need
+> the same treatment.
+
+Both bugs are upstream MeshCentral (confirmed on 1.2.0) and worth reporting so they stop
+needing re-application.
+
 ## Why not the console's "Add Agent" download?
 
 MeshCentral's built-in macOS download is a **legacy `.mpkg`** (PackageMaker bundle). Modern
@@ -75,4 +116,6 @@ the hosted shell installer.
 
 - [ ] Re-copy the 3 fixed served binaries into `agents/` and restart MeshCentral.
 - [ ] Re-copy the `meshsetup/` files into `public/`.
+- [ ] Re-apply `viewer-cmdkey.patch` to `public/scripts/agent-desktop-0.0.2.js`, then test
+      Cmd+C on a macOS remote in **both** Chrome and Firefox.
 - [ ] `curl -fsSI https://<host>/ ` → 200, and a login → 200 (web UI healthy).
