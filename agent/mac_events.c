@@ -61,38 +61,55 @@ static IOHIDUserDeviceRef g_kbd_dev  = NULL;
 static IOHIDUserDeviceRef g_mouse_dev = NULL;
 
 // ---- CGEvent fallback globals ----------------------------------------------
-// Flags that CGEventSourceCreate(kCGEventSourceStateHIDSystemState) merges into
-// every synthesized event from the machine's live HID state, but that we never
-// intend to inject. Both have been observed stuck ON on a real Mac and both
-// silently corrupt ordinary typing:
-//   SecondaryFn - a stray Fn (Globe) turns 'e' into Fn+E (emoji picker).
-//   NumericPad  - makes the system read the keystroke with *keypad* semantics,
-//                 where the decimal-separator key yields '.', so an injected
-//                 ',' arrives as '.'. Invisible to UCKeyTranslate, which does
-//                 not model this flag - the event itself carries a correct ','
-//                 right up to CGEventPost, and is reinterpreted after that.
-// Real modifiers (shift/ctrl/opt/cmd) are deliberately NOT stripped: those are
-// injected as genuine modifier key events and must stay merged for shortcuts.
-#define KVM_STRAY_FLAGS ((CGEventFlags)(kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad))
+// ---- Injected-keyboard modifier state --------------------------------------
+// The remote keyboard is treated as a keyboard of its own, independent of
+// whatever is physically attached to this Mac. Two things make that work:
+//
+//  1. Events are created from a PRIVATE event source, not
+//     kCGEventSourceStateHIDSystemState. The HID source merges this machine's
+//     *live* physical modifier state into every synthesized event, which
+//     silently corrupts remote typing: a stuck Fn turns 'e' into Fn+E (emoji
+//     picker), and a stuck NumericPad makes the system read the keystroke with
+//     keypad semantics, where the decimal-separator key yields '.', so an
+//     injected ',' arrives as '.'. A private source inherits nothing, so the
+//     only flags on a fresh event are the ones macOS derives from the keycode
+//     itself (arrow and keypad keys legitimately carry Fn|NumericPad - those
+//     must be preserved, not stripped).
+//
+//  2. Modifier state is tracked here and applied explicitly, rather than
+//     relying on the HID state picking up our injected modifier key events.
+//     That inheritance was inherently racy: post_cgevent() posts
+//     asynchronously, but CGEventCreateKeyboardEvent() snapshots modifier
+//     state synchronously at creation - so on Cmd+C the 'c' event was built
+//     before the queued Cmd-down had actually been posted, read a state with
+//     no Command set, and went out bare. The shortcut never formed. Setting
+//     the flags ourselves removes the race entirely.
+static CGEventFlags g_modFlags = 0;
 
-// Strip the stray flags, and record it when there was actually something to
-// strip. The condition is intermittent (the flags stick and unstick with HID
-// state), so this detector is what tells us the fix is doing real work rather
-// than the flags merely happening to be clear. Costs nothing when they are.
-static void kvm_strip_stray_flags(CGEventRef e, const char *where, int keycode)
+// Map a modifier VK to its CGEvent flag. Returns 0 for non-modifier keys.
+static CGEventFlags vk_mod_flag(unsigned char vk)
 {
-    CGEventFlags f = CGEventGetFlags(e);
-    if (f & KVM_STRAY_FLAGS) {
-        char b[160];
-        int l = snprintf(b, sizeof(b),
-            "STRAY-FLAGS-STRIPPED %s kc=%d flags=0x%llx fn=%d numpad=%d t=%ld\n",
-            where, keycode, (unsigned long long)f,
-            (f & kCGEventFlagMaskSecondaryFn) ? 1 : 0,
-            (f & kCGEventFlagMaskNumericPad) ? 1 : 0, (long)time(NULL));
-        FILE *ff = fopen("/tmp/kvm_key_debug.log", "a");
-        if (ff) { fwrite(b, 1, l, ff); fclose(ff); }
+    switch (vk) {
+        case VK_SHIFT:   return kCGEventFlagMaskShift;
+        case VK_CONTROL: return kCGEventFlagMaskControl;
+        case VK_MENU:    return kCGEventFlagMaskAlternate;   // Option
+        case VK_LWIN:
+        case VK_RWIN:    return kCGEventFlagMaskCommand;
+        default:         return 0;
     }
-    CGEventSetFlags(e, f & ~KVM_STRAY_FLAGS);
+}
+
+// Apply our tracked modifiers on top of the event's own keycode-derived flags.
+static void kvm_apply_mod_flags(CGEventRef e)
+{
+    CGEventSetFlags(e, CGEventGetFlags(e) | g_modFlags);
+}
+
+// Drop all injected modifier state. Called when a viewer (re)attaches so a
+// modifier held at disconnect can't stay latched into the next session.
+void kvm_reset_modifiers(void)
+{
+    g_modFlags = 0;
 }
 
 // Depth of the in-flight event queue. Mouse moves and (especially) pixel-unit
@@ -513,7 +530,8 @@ static void post_init_once(void *ctx)
     (void)ctx;
     g_postSem = dispatch_semaphore_create(POST_MAX_INFLIGHT);
     g_postQ   = dispatch_queue_create("meshagent.cgevent", DISPATCH_QUEUE_SERIAL);
-    g_source  = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    // Private, NOT HIDSystemState: inherit nothing from the physical keyboard.
+    g_source  = CGEventSourceCreate(kCGEventSourceStatePrivate);
     g_lw_pid  = find_proc_by_name("loginwindow");
     { char b[96]; int l=snprintf(b,sizeof(b),"cg_fallback: source=%p lw_pid=%d\n",(void*)g_source,(int)g_lw_pid); write(STDOUT_FILENO,b,l); }
 }
@@ -1287,8 +1305,9 @@ static void inject_key(CGKeyCode keycode, int down)
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
     CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, down ? true : false);
     if (e) {
-        // Drop the stray HID-state flags this event inherited (see KVM_STRAY_FLAGS).
-        kvm_strip_stray_flags(e, "inject_key", (int)keycode);
+        // Apply our own modifier state (see g_modFlags); the event keeps whatever
+        // flags macOS derived from the keycode itself (e.g. arrows carry Fn|NumericPad).
+        kvm_apply_mod_flags(e);
         post_cgevent(e); CFRelease(e);
     }
 }
@@ -1327,6 +1346,27 @@ void KeyAction(unsigned char vk, int up)
 		return;
 	}
 	if (vk == VK_CAPITAL && up) { g_capsLock = g_capsLock ? 0 : 1; }
+
+	// Track injected modifier state so it can be applied explicitly to every
+	// subsequent key event (see g_modFlags). TEMP: log modifiers to confirm the
+	// viewer actually delivers Cmd-down - if it never arrives, no agent-side fix
+	// can make Cmd+C work and the problem is in the browser/viewer instead.
+	{
+		CGEventFlags mf = vk_mod_flag(vk);
+		if (mf) {
+			if (up) { g_modFlags &= ~mf; } else { g_modFlags |= mf; }
+			FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
+			if (_f) {
+				fprintf(_f, "MODIFIER vk=0x%02x %s -> g_modFlags=0x%llx (cmd=%d shift=%d ctrl=%d opt=%d) t=%ld\n",
+					vk, up ? "UP  " : "DOWN", (unsigned long long)g_modFlags,
+					(g_modFlags & kCGEventFlagMaskCommand)   ? 1 : 0,
+					(g_modFlags & kCGEventFlagMaskShift)     ? 1 : 0,
+					(g_modFlags & kCGEventFlagMaskControl)   ? 1 : 0,
+					(g_modFlags & kCGEventFlagMaskAlternate) ? 1 : 0, (long)time(NULL));
+				fclose(_f);
+			}
+		}
+	}
 
 	{ char _b[64]; int _l = snprintf(_b, sizeof(_b), "KeyAction: vk=0x%02x kc=%d up=%d\n", vk, (int)keycode, up); write(STDOUT_FILENO, _b, _l); }
 	inject_key(keycode, !up);
@@ -1399,9 +1439,9 @@ void KeyActionUnicode(uint16_t unicode, int up)
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
     CGEventRef e = CGEventCreateKeyboardEvent(g_source, keycode, up ? false : true);
     if (!e) return;
-    // Drop the stray HID-state flags this event inherited (see KVM_STRAY_FLAGS).
-    // NumericPad in particular made an injected ',' arrive as '.'.
-    kvm_strip_stray_flags(e, "KeyActionUnicode", (int)keycode);
+    // Apply our own modifier state (see g_modFlags) so shortcuts like Cmd+C form
+    // reliably regardless of when the modifier key event actually gets posted.
+    kvm_apply_mod_flags(e);
     // Override the character produced by this key event with the Unicode value
     UniChar uc = (UniChar)unicode;
     CGEventKeyboardSetUnicodeString(e, 1, &uc);

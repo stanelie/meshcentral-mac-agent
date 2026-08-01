@@ -580,6 +580,7 @@ void* kvm_mainloopinput(void* param)
 				if (newfd >= 0)
 				{
 					kvm_flog("EVICT stale kvm connection fd=%d for new fd=%d\n", KVM_AGENT_FD, newfd);
+					{ extern void kvm_reset_modifiers(void); kvm_reset_modifiers(); }
 					close(KVM_AGENT_FD);
 					KVM_AGENT_FD = newfd;
 					SCREEN_HEIGHT = SCREEN_WIDTH = 0; // force a clean reinit for the new viewer
