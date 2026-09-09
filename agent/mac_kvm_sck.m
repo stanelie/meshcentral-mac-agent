@@ -258,9 +258,12 @@ static void* dwclip_listener_thread(void *arg)
     unlink(DWCLIP_SOCK_PATH);
 
     if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(lfd); return NULL; }
-    // Root daemon connects; owner is the session user. Allow all so connect works
-    // regardless of who the daemon runs as; the socket only exposes clipboard.
-    chmod(DWCLIP_SOCK_PATH, 0666);
+    // 0600, NOT 0666. This socket hands out the console user's clipboard, which
+    // routinely holds passwords pasted from a password manager. At 0666 any
+    // local user or sandboxed app could read and overwrite it. The only intended
+    // peer is the root MeshAgent daemon, and root bypasses file permissions
+    // entirely, so 0600 keeps that path working while shutting out everyone else.
+    chmod(DWCLIP_SOCK_PATH, 0600);
     if (listen(lfd, 8) < 0) { close(lfd); return NULL; }
 
     sck_flog("dwclip: listening on %s\n", DWCLIP_SOCK_PATH);

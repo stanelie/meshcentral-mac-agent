@@ -26,6 +26,7 @@
 #define CS_ENTITLEMENTS_VALIDATED    0x00004000  // bit 14 (NOT 0x20000 which is CS_LINKER_SIGNED)
 extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #include <arpa/inet.h>  // ntohl
+#include <sys/time.h>   // struct timeval (SO_RCVTIMEO/SO_SNDTIMEO)
 
 // mach_port_kernel_object is in <mach/mach_port.h> (SDK declares it with ipc_space_read_t).
 // IKOT_IOKIT_OBJECT (24) = io_service_t / io_iterator_t
@@ -133,6 +134,7 @@ static time_t   g_vnc_last_attempt = 0;   // unix timestamp of last connect atte
 static int      g_lw_cached       = -1;   // cached loginwindow state (-1=unknown, 0=no, 1=yes)
 static time_t   g_lw_cache_time   = 0;    // timestamp of last loginwindow check
 static int      g_vnc_shift_down  = 0;    // tracks physical Shift state for the VNC key path
+static uint8_t  g_vnc_btnmask     = 0;    // RFB button mask (defined again near vnc_inject_mouse)
 
 // ---- Helpers ---------------------------------------------------------------
 static pid_t find_proc_by_name(const char *name)
@@ -628,6 +630,12 @@ static int vnc_write_all(int fd, const uint8_t *buf, int n)
 static void vnc_disconnect(void)
 {
     if (g_vnc_fd >= 0) { close(g_vnc_fd); g_vnc_fd = -1; }
+    // screensharingd forgets our modifier/button state when the session ends.
+    // Keeping ours would resume with a phantom Shift held (everything typed at
+    // the login window comes out uppercase / shifted, so passwords fail) or a
+    // phantom mouse button held. Clear it so the next connect starts neutral.
+    g_vnc_shift_down = 0;
+    g_vnc_btnmask    = 0;
 }
 
 // Read VNC password from file. Applies VNC DES key-bit-reversal quirk.
@@ -664,6 +672,12 @@ static int vnc_connect(void)
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return 0;
 
+    // Without this, a write to a socket screensharingd has closed (it restarts
+    // on logout, on "Screen Sharing" being toggled, and on OS update) raises
+    // SIGPIPE, whose default disposition KILLS the agent. vnc_write_all's error
+    // return is only reachable if the signal is suppressed first.
+    { int on = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)); }
+
     struct sockaddr_in addr = {0};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(5900);
@@ -681,7 +695,16 @@ static int vnc_connect(void)
     int sockerr = 0; socklen_t elen = sizeof(sockerr);
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &elen);
     if (sockerr != 0) { close(fd); return 0; }
-    fcntl(fd, F_SETFL, 0); // restore blocking
+    // Restore blocking mode without clobbering the socket's other flags.
+    { int fl = fcntl(fd, F_GETFL, 0); if (fl != -1) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK); }
+
+    // Bound every subsequent read/write. The RFB handshake below runs on the
+    // thread that services KVM input; a screensharingd that accepts the socket
+    // but stalls mid-handshake would otherwise block it forever, freezing both
+    // keyboard and mouse with no way to recover short of restarting the agent.
+    { struct timeval tv = { 3, 0 };
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)); }
 
     // Server greeting: "RFB xxx.yyy\n"
     uint8_t greeting[12];
@@ -870,9 +893,9 @@ static void vnc_inject_key(CGKeyCode adb, int down)
     }
 }
 
-// Current RFB button mask (bit0=left, bit1=middle, bit2=right, bit3=wheelUp,
-// bit4=wheelDown). RFB PointerEvents carry a mask, not up/down transitions.
-static uint8_t g_vnc_btnmask = 0;
+// (g_vnc_btnmask is declared near the top with the other VNC state: bit0=left,
+// bit1=middle, bit2=right, bit3=wheelUp, bit4=wheelDown. RFB PointerEvents
+// carry a mask, not up/down transitions.)
 
 // Send an RFB PointerEvent to screensharingd/localhost:5900 for login-screen
 // mouse (movement, buttons, wheel). Coordinates are absolute framebuffer pixels.
