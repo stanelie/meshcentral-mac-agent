@@ -1,3 +1,10 @@
 .DS_Store
 *.swp
 *.o
+
+# Local decrypted code-signing key material — NEVER commit (only meshsign.p12.enc is tracked)
+signing/key.pem
+signing/meshsign.p12
+signing/cert.pem
+signing/cert.conf
+signing/README.md.local-master

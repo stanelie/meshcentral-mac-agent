@@ -35,7 +35,15 @@ codesign -f -s - --identifier meshagent_osx-x86-64 meshagent_osx-x86-64
 
 > The `--identifier` **must** be `meshagent_osx-arm-64` / `meshagent_osx-x86-64`. macOS TCC
 > looks permissions up by the code-signing identifier; re-signing without it breaks the
-> Screen Recording grant. Ad-hoc signing (`-s -`) is fine.
+> Screen Recording grant. Ad-hoc signing (`-s -`) is fine for a local test build.
+
+> **For anything you ship or serve, sign with the stable cert instead of ad-hoc** —
+> `../signing/sign-agent-binaries.sh` (see [../signing/README.md](../signing/README.md)).
+> Ad-hoc gives a **cdhash-based** designated requirement, so the TCC grant is tied to that
+> exact build and every rebuild forces users to re-approve Screen Recording. The cert gives
+> `identifier "…" and certificate root = H"3d2edf19…"`, which is **hash-independent**, so
+> grants survive rebuilds. The binaries in [`../prebuilt/`](../prebuilt/) are cert-signed;
+> replacing them with ad-hoc builds silently breaks grant persistence across the fleet.
 
 > **Build on a macOS 14+ SDK for any target that runs macOS 14+ (e.g. Apple Silicon on
 > Sonoma/Sequoia/Tahoe).** `mac_kvm_sck.m` uses ScreenCaptureKit (`SCScreenshotManager`),

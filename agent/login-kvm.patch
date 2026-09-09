@@ -125,10 +125,10 @@ index b70a508..d403f67 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..c4f37fe 100644
+index c27e1f0..3849987 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,1016 @@
+@@ -2,13 +2,1039 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -156,6 +156,7 @@ index c27e1f0..c4f37fe 100644
 +#define CS_ENTITLEMENTS_VALIDATED    0x00004000  // bit 14 (NOT 0x20000 which is CS_LINKER_SIGNED)
 +extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 +#include <arpa/inet.h>  // ntohl
++#include <sys/time.h>   // struct timeval (SO_RCVTIMEO/SO_SNDTIMEO)
  
 -static const int g_keymapLen = 114; // Modify this when you change anything in g_keymap.
 +// mach_port_kernel_object is in <mach/mach_port.h> (SDK declares it with ipc_space_read_t).
@@ -264,6 +265,7 @@ index c27e1f0..c4f37fe 100644
 +static int      g_lw_cached       = -1;   // cached loginwindow state (-1=unknown, 0=no, 1=yes)
 +static time_t   g_lw_cache_time   = 0;    // timestamp of last loginwindow check
 +static int      g_vnc_shift_down  = 0;    // tracks physical Shift state for the VNC key path
++static uint8_t  g_vnc_btnmask     = 0;    // RFB button mask (defined again near vnc_inject_mouse)
 +
 +// ---- Helpers ---------------------------------------------------------------
 +static pid_t find_proc_by_name(const char *name)
@@ -759,6 +761,12 @@ index c27e1f0..c4f37fe 100644
 +static void vnc_disconnect(void)
 +{
 +    if (g_vnc_fd >= 0) { close(g_vnc_fd); g_vnc_fd = -1; }
++    // screensharingd forgets our modifier/button state when the session ends.
++    // Keeping ours would resume with a phantom Shift held (everything typed at
++    // the login window comes out uppercase / shifted, so passwords fail) or a
++    // phantom mouse button held. Clear it so the next connect starts neutral.
++    g_vnc_shift_down = 0;
++    g_vnc_btnmask    = 0;
 +}
 +
 +// Read VNC password from file. Applies VNC DES key-bit-reversal quirk.
@@ -795,6 +803,12 @@ index c27e1f0..c4f37fe 100644
 +    int fd = socket(AF_INET, SOCK_STREAM, 0);
 +    if (fd < 0) return 0;
 +
++    // Without this, a write to a socket screensharingd has closed (it restarts
++    // on logout, on "Screen Sharing" being toggled, and on OS update) raises
++    // SIGPIPE, whose default disposition KILLS the agent. vnc_write_all's error
++    // return is only reachable if the signal is suppressed first.
++    { int on = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)); }
++
 +    struct sockaddr_in addr = {0};
 +    addr.sin_family      = AF_INET;
 +    addr.sin_port        = htons(5900);
@@ -812,7 +826,16 @@ index c27e1f0..c4f37fe 100644
 +    int sockerr = 0; socklen_t elen = sizeof(sockerr);
 +    getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &elen);
 +    if (sockerr != 0) { close(fd); return 0; }
-+    fcntl(fd, F_SETFL, 0); // restore blocking
++    // Restore blocking mode without clobbering the socket's other flags.
++    { int fl = fcntl(fd, F_GETFL, 0); if (fl != -1) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK); }
++
++    // Bound every subsequent read/write. The RFB handshake below runs on the
++    // thread that services KVM input; a screensharingd that accepts the socket
++    // but stalls mid-handshake would otherwise block it forever, freezing both
++    // keyboard and mouse with no way to recover short of restarting the agent.
++    { struct timeval tv = { 3, 0 };
++      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)); }
 +
 +    // Server greeting: "RFB xxx.yyy\n"
 +    uint8_t greeting[12];
@@ -1001,9 +1024,9 @@ index c27e1f0..c4f37fe 100644
 +    }
 +}
 +
-+// Current RFB button mask (bit0=left, bit1=middle, bit2=right, bit3=wheelUp,
-+// bit4=wheelDown). RFB PointerEvents carry a mask, not up/down transitions.
-+static uint8_t g_vnc_btnmask = 0;
++// (g_vnc_btnmask is declared near the top with the other VNC state: bit0=left,
++// bit1=middle, bit2=right, bit3=wheelUp, bit4=wheelDown. RFB PointerEvents
++// carry a mask, not up/down transitions.)
 +
 +// Send an RFB PointerEvent to screensharingd/localhost:5900 for login-screen
 +// mouse (movement, buttons, wheel). Coordinates are absolute framebuffer pixels.
@@ -1148,7 +1171,7 @@ index c27e1f0..c4f37fe 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1135,316 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1158,310 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
@@ -1271,9 +1294,7 @@ index c27e1f0..c4f37fe 100644
 +        return;
 +    }
 +
-+    // Mouse is NOT covered by SecureEventInput, so CGEventPost(kCGHIDEventTap)
-+    // should move the cursor and click at the login window. Fall through to the
-+    // standard CGEvent path below (no special-casing needed for the login screen).
++    // In-session path: virtual HID device if we have one, else CGEvent.
 +    if (g_mouse_dev) {
 +        MouseReport r = {0};
 +        if (button == MOUSEEVENTF_LEFTDOWN)  r.buttons |= 0x01;
@@ -1386,13 +1407,13 @@ index c27e1f0..c4f37fe 100644
 +			    g_clickCount > 0 ? g_clickCount : 1);
  		}
 -		CFRelease(e);
--	}
+ 	}
 -	else if (wheel != 0)
 -	{
 -		e = CGEventCreateScrollWheelEvent(source, kCGScrollEventUnitPixel, 1, wheel);
 -		CGEventPost(kCGHIDEventTap, e);
 -		CFRelease(e);
- 	}
+-	}
 -	if (source != NULL) CFRelease(source);
 +	if (e) { post_cgevent(e); CFRelease(e); }
  }
@@ -1404,10 +1425,6 @@ index c27e1f0..c4f37fe 100644
 +
 +static void inject_key(CGKeyCode keycode, int down)
 +{
-+    // At the login window, try the standard HID event tap first. SecureEventInput
-+    // may drop keyboard events when the password field is focused, but mouse and
-+    // non-secure typing go through. (Legacy VNC is deprecated on Tahoe and does
-+    // nothing, so vnc_inject_key is no longer used here.)
 +    if (is_loginwindow()) {
 +        // SecureEventInput drops CGEventPost keyboard events when the login-window
 +        // password field is focused. Route through screensharingd's VNC server on
@@ -1606,6 +1623,17 @@ index c27e1f0..c4f37fe 100644
 +    post_cgevent(e);
 +    CFRelease(e);
  }
+diff --git a/meshcore/KVM/MacOS/mac_events.h b/meshcore/KVM/MacOS/mac_events.h
+index d6bb534..adf87a7 100644
+--- a/meshcore/KVM/MacOS/mac_events.h
++++ b/meshcore/KVM/MacOS/mac_events.h
+@@ -378,5 +378,6 @@ struct keymap_t {
+ extern void MouseAction(double absX, double absY, int button, short wheel);
+ extern void KeyAction(unsigned char vk, int up);
+ extern void KeyActionUnicode(uint16_t unicode, int up);
++extern void hid_inject_init(void);
+ 
+ #endif /* LINUX_EVENTS_H_ */
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
 index 6d57690..217b5e0 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
@@ -2135,10 +2163,10 @@ index 6d57690..217b5e0 100644
 \ No newline at end of file
 diff --git a/meshcore/KVM/MacOS/mac_kvm_sck.m b/meshcore/KVM/MacOS/mac_kvm_sck.m
 new file mode 100644
-index 0000000..cedf5ff
+index 0000000..cb8f518
 --- /dev/null
 +++ b/meshcore/KVM/MacOS/mac_kvm_sck.m
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,295 @@
 +/*
 + * ScreenCaptureKit wrapper for MeshAgent KVM.
 + *
@@ -2399,9 +2427,12 @@ index 0000000..cedf5ff
 +    unlink(DWCLIP_SOCK_PATH);
 +
 +    if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(lfd); return NULL; }
-+    // Root daemon connects; owner is the session user. Allow all so connect works
-+    // regardless of who the daemon runs as; the socket only exposes clipboard.
-+    chmod(DWCLIP_SOCK_PATH, 0666);
++    // 0600, NOT 0666. This socket hands out the console user's clipboard, which
++    // routinely holds passwords pasted from a password manager. At 0666 any
++    // local user or sandboxed app could read and overwrite it. The only intended
++    // peer is the root MeshAgent daemon, and root bypasses file permissions
++    // entirely, so 0600 keeps that path working while shutting out everyone else.
++    chmod(DWCLIP_SOCK_PATH, 0600);
 +    if (listen(lfd, 8) < 0) { close(lfd); return NULL; }
 +
 +    sck_flog("dwclip: listening on %s\n", DWCLIP_SOCK_PATH);
@@ -2528,3 +2559,45 @@ index fe8228b..afe32cd 100644
  #endif
  
  
+diff --git a/microstack/ILibProcessPipe.c b/microstack/ILibProcessPipe.c
+index f74b838..5e1d200 100644
+--- a/microstack/ILibProcessPipe.c
++++ b/microstack/ILibProcessPipe.c
+@@ -87,6 +87,37 @@ static int ILibProcessPipe_TryJoinAsid_OSX(au_asid_t asid)
+ 	return 0;
+ }
+ 
++// Join the WindowServer's audit session — needed for the loginwindow
++// kvmagent (uid 0, gui/0) where there is no logged-in user session to
++// find. The WindowServer owns the display at the login screen; joining
++// its session makes CGMainDisplayID() return a valid display ID.
++int ILibProcessPipe_JoinWindowServerAuditSession_OSX(void)
++{
++	int n = proc_listallpids(NULL, 0);
++	if (n <= 0) return -1;
++	pid_t *pids = (pid_t*)calloc(n, sizeof(pid_t));
++	if (pids == NULL) return -1;
++	int got = proc_listallpids(pids, n * (int)sizeof(pid_t));
++	if (got <= 0) { free(pids); return -1; }
++	int count = got / (int)sizeof(pid_t);
++	int rc = -1;
++	for (int i = 0; i < count; i++)
++	{
++		if (pids[i] == 0) continue;
++		char name[PROC_PIDPATHINFO_MAXSIZE];
++		if (proc_name(pids[i], name, sizeof(name)) <= 0) continue;
++		if (strcmp(name, "WindowServer") != 0) continue;
++		struct auditpinfo_addr ap;
++		memset(&ap, 0, sizeof(ap));
++		ap.ap_pid = pids[i];
++		if (auditon(A_GETPINFO_ADDR, &ap, sizeof(ap)) != 0) continue;
++		if (ap.ap_asid == 0 || ap.ap_asid == AU_DEFAUDITSID) continue;
++		if (ILibProcessPipe_TryJoinAsid_OSX(ap.ap_asid) == 0) { rc = 0; break; }
++	}
++	free(pids);
++	return rc;
++}
++
+ int ILibProcessPipe_JoinUserAuditSession_OSX(uid_t uid);
+ int ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(uid_t uid) { return ILibProcessPipe_JoinUserAuditSession_OSX(uid); }
+ int ILibProcessPipe_JoinUserAuditSession_OSX(uid_t uid)

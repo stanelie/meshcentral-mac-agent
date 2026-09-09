@@ -1217,9 +1217,7 @@ void MouseAction(double absX, double absY, int button, short wheel)
         return;
     }
 
-    // Mouse is NOT covered by SecureEventInput, so CGEventPost(kCGHIDEventTap)
-    // should move the cursor and click at the login window. Fall through to the
-    // standard CGEvent path below (no special-casing needed for the login screen).
+    // In-session path: virtual HID device if we have one, else CGEvent.
     if (g_mouse_dev) {
         MouseReport r = {0};
         if (button == MOUSEEVENTF_LEFTDOWN)  r.buttons |= 0x01;
@@ -1310,10 +1308,6 @@ extern ILibQueue g_messageQ;
 
 static void inject_key(CGKeyCode keycode, int down)
 {
-    // At the login window, try the standard HID event tap first. SecureEventInput
-    // may drop keyboard events when the password field is focused, but mouse and
-    // non-secure typing go through. (Legacy VNC is deprecated on Tahoe and does
-    // nothing, so vnc_inject_key is no longer used here.)
     if (is_loginwindow()) {
         // SecureEventInput drops CGEventPost keyboard events when the login-window
         // password field is focused. Route through screensharingd's VNC server on
