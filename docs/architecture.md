@@ -170,9 +170,15 @@ So the fixed build must be deployed as the served binary too. See `server/README
 
 ## Security posture
 
-- **`:5900` is loopback-only** via a `pf` anchor the installer ships (`set skip on lo0` +
-  Apple's default anchors + `block drop in quick proto tcp … port 5900`), re-applied at boot
-  by a LaunchDaemon. Only the local kvmagent reaches screensharingd.
+- **`:5900` exposure is policy-driven** (`SS_LAN_ACCESS` = `lan` (default) / `allow` /
+  `block`) via a `pf` ruleset the installer generates by appending to the system
+  `/etc/pf.conf`, re-applied at boot by a LaunchDaemon. Note that Apple Screen Sharing
+  (RFB security type 30) and the legacy VNC this agent uses (type 2) are served by the
+  **same daemon on the same port**, so blocking one blocks the other — `block` is what
+  makes a Mac unreachable by normal Screen Sharing. The generated ruleset is validated
+  with `pfctl -n -f` before it is loaded, and uninstall restores `/etc/pf.conf` rather
+  than calling `pfctl -d` (pf enable/disable is reference counted and shared with VPNs
+  and Internet Sharing).
 - **Per-machine random VNC password** in `kvm/vnc.pw` (mode 600, root) — no shared secret.
 - Operator ↔ agent uses MeshCentral's normal end-to-end tunnel; the VNC hop is loopback only.
 

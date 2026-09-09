@@ -172,15 +172,48 @@ matching `--identifier`. Prebuilt signed binaries are in [`prebuilt/`](prebuilt/
 
 ---
 
+## Coexisting with normal macOS Screen Sharing
+
+`screensharingd` serves **both** Apple Screen Sharing (RFB security type 30, Apple DH) and
+the legacy VNC (type 2) this agent uses for login-window input — on the **same port 5900,
+from the same daemon**. Verified against a stock Mac:
+
+| Client negotiates | screensharingd offers |
+|---|---|
+| RFB 3.3 (what this agent uses) | `2` — legacy VNC (DES) |
+| RFB 3.8 (Screen Sharing.app) | `30, 33, 36, 2, 35` — `30` = Apple DH |
+
+So the two **cannot be separated by port**, only by source address. The installer's
+`SS_LAN_ACCESS` setting controls that:
+
+| `SS_LAN_ACCESS` | `:5900` reachable from | Screen Sharing from another Mac |
+|---|---|---|
+| `lan` *(default)* | loopback + private/link-local ranges | **works on the LAN**, refused from public networks |
+| `allow` | anywhere the network allows (no `pf` rules) | **works everywhere** |
+| `block` | loopback only | **does not work** |
+
+```bash
+SS_LAN_ACCESS=allow sudo -E bash meshinstall.sh
+```
+
+> Earlier versions of this installer hardcoded the `block` behaviour, which is why a Mac
+> with the agent installed could no longer be reached by normal Screen Sharing.
+
 ## Security notes
 
-- `screensharingd`'s `:5900` is restricted to **loopback only** via a `pf` anchor the
-  installer ships — the VNC password is never reachable from the network; only the local
-  kvmagent uses it.
-- Each machine gets a **unique random VNC password** (`kvm/vnc.pw`, root-only), not a
-  shared secret.
+- Each machine gets a **unique random VNC password** (`kvm/vnc.pw`, root-only, 8 chars —
+  the maximum a VNC DES key can carry), not a shared secret.
+- With `SS_LAN_ACCESS=lan` or `allow`, that legacy-VNC password becomes an **additional
+  authentication surface on the LAN** alongside Apple's own auth. It is an online-only
+  brute force against ~2.2e14 combinations (the agent authenticates over loopback, so no
+  challenge/response is ever observable on the wire), but it is a real trade for the
+  convenience of native Screen Sharing. Use `block` if you do not need it.
+- The agent's own directory `kvm/` is `root:wheel 0755`: it holds a binary launchd
+  executes **as root** at the login window, so it must not be group-writable.
 - Login-window input flows over loopback to Apple's screensharingd; the operator↔agent
   link is MeshCentral's normal end-to-end tunnel.
+- `uninstall.sh` restores the stock `pf` ruleset and turns legacy VNC back off if it was
+  off before install.
 
 ## Credits & license
 
