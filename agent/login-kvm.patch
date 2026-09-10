@@ -3056,7 +3056,7 @@ index 0000000..cb8f518
 +    }
 +}
 diff --git a/meshcore/agentcore.c b/meshcore/agentcore.c
-index fe8228b..b37d2d5 100644
+index fe8228b..5176b9c 100644
 --- a/meshcore/agentcore.c
 +++ b/meshcore/agentcore.c
 @@ -74,6 +74,7 @@ int gRemoteMouseRenderDefault = 0;
@@ -3160,35 +3160,39 @@ index fe8228b..b37d2d5 100644
  #endif
  
  
-@@ -4564,6 +4571,34 @@ MeshAgentHostContainer* MeshAgent_Create(MeshCommand_AuthInfo_CapabilitiesMask c
+@@ -4564,6 +4571,38 @@ MeshAgentHostContainer* MeshAgent_Create(MeshCommand_AuthInfo_CapabilitiesMask c
  		FreeLibrary(wsCORE);
  		wsCORE = NULL;
  	}
 +#elif defined(__APPLE__)
-+	// Report the Mac's OWN name -- what System Settings > General > About shows,
-+	// and what an administrator recognises in the MeshCentral device list.
++	// Report the Mac's OWN name rather than whatever DHCP/DNS called it.
 +	//
-+	// gethostname() on macOS returns whatever DHCP/DNS handed the machine, which
-+	// is frequently neither stable nor meaningful. Measured on the Parallels test
-+	// VM: gethostname() = "macos.shared" (the same for every guest on that host),
-+	// while ComputerName = "user1's Virtual Machine". Without this, every Mac
-+	// enrolled from such a network lands in the device list under one anonymous
-+	// shared name.
++	// gethostname() on macOS returns the network-assigned name, which is
++	// frequently neither stable nor meaningful. Measured on the Parallels test
++	// VM: gethostname() = "macos.shared" -- the same string for every guest on
++	// that host, so every Mac enrolled from such a network lands in the device
++	// list under one anonymous shared name.
 +	//
-+	// ComputerName is user-facing and may contain spaces and non-ASCII (Apple
-+	// uses a typographic apostrophe in the default), so copy it as UTF-8 and
-+	// fall back to gethostname() if it is unset or does not fit.
++	// Use LocalHostName, NOT ComputerName. Both name the machine, but
++	// ComputerName is free-form user-facing text ("user1's Virtual Machine",
++	// with a typographic apostrophe) while LocalHostName is the Bonjour name
++	// macOS derives from it and constrains to ASCII letters, digits and hyphens
++	// ("user1s-Virtual-Machine"). A name with spaces and non-ASCII in it is a
++	// standing hazard for anything downstream that builds a URL, a filename or a
++	// shell command from it, and gains nothing here.
++	//
++	// Falls back to gethostname() when LocalHostName is unset or does not fit.
 +	{
 +		int got = 0;
-+		CFStringRef cn = SCDynamicStoreCopyComputerName(NULL, NULL);
-+		if (cn != NULL)
++		CFStringRef lhn = SCDynamicStoreCopyLocalHostName(NULL);
++		if (lhn != NULL)
 +		{
-+			if (CFStringGetCString(cn, retVal->hostname, (CFIndex)sizeof(retVal->hostname), kCFStringEncodingUTF8) != false
++			if (CFStringGetCString(lhn, retVal->hostname, (CFIndex)sizeof(retVal->hostname), kCFStringEncodingUTF8) != false
 +				&& retVal->hostname[0] != 0)
 +			{
 +				got = 1;
 +			}
-+			CFRelease(cn);
++			CFRelease(lhn);
 +		}
 +		if (got == 0) { gethostname(retVal->hostname, (int)sizeof(retVal->hostname)); }
 +	}
