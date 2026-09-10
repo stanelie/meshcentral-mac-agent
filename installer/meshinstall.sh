@@ -272,6 +272,31 @@ WLP
 fi
 echo "MeshAgent installed for group '$MESH_NAME' ($(uname -m))."
 
+# ---- privacy permissions, asked NOW rather than on the first remote session ----
+# Run the walkthrough as the CONSOLE USER: TCC attributes a grant to the running
+# program, and the grants have to land on the kvm binary inside that user's Aqua
+# session. Root cannot stand in for them.
+#
+# MESH_SKIP_PERMS=1 skips this (unattended/MDM installs, where a PPPC profile
+# should be delivering these grants instead).
+# MESH_NO_FDA=1 skips only the optional Full Disk Access step.
+if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ "$CUSER" != "root" ]; then
+    if [ -e /dev/tty ]; then
+        FDAARG=""
+        [ "${MESH_NO_FDA:-0}" = "1" ] && FDAARG="nofda"
+        /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" \
+            "$D/kvm/$EXE" -requestperms $FDAARG </dev/tty >/dev/tty 2>&1 || \
+            echo "  (permission walkthrough exited early -- grant them in System Settings)"
+        # Grants only take effect on a fresh process, so restart the agent.
+        /bin/launchctl bootout "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
+        sleep 1
+        /bin/launchctl bootstrap "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
+    else
+        echo "  (no terminal: skipping the permission walkthrough --"
+        echo "   grant Screen Recording and Accessibility in System Settings)"
+    fi
+fi
+
 # ---- post-install verification ------------------------------------------
 # Everything below is checkable without Full Disk Access, so the installer never
 # needs FDA itself.
@@ -307,13 +332,18 @@ else
     echo "  [ok]   Screen Sharing was already enabled before install"
 fi
 echo
-echo "--- remaining MANUAL steps (macOS will not let an installer do these) ---"
-echo "  1. System Settings > General > Sharing > Screen Sharing  ......  ON"
+echo "--- remaining MANUAL step (macOS will not let an installer do this one) ---"
+echo "  System Settings > General > Sharing > Screen Sharing  ......  ON"
 echo "     (this is what grants com.apple.screensharing.agent the ScreenCapture"
-echo "      + PostEvent TCC rights that make login-window input work at all)"
-echo "  2. System Settings > Privacy & Security > Screen Recording  ...  enable 'meshagent'"
-echo "  3. System Settings > Privacy & Security > Accessibility  ......  enable 'meshagent'"
-echo "     (needed for in-session keyboard/mouse; the login window does not use it)"
+echo "      + PostEvent TCC rights that make login-window input work at all;"
+echo "      enabling the service from the command line does NOT create them)"
+echo
+echo "  Screen Recording and Accessibility were requested above by the permission"
+echo "  walkthrough. If you skipped a step there, grant it in"
+echo "  System Settings > Privacy & Security, then run:"
+echo "      sudo launchctl bootout gui/\$(id -u) /Library/LaunchAgents/$SV.plist"
+echo "      sudo launchctl bootstrap gui/\$(id -u) /Library/LaunchAgents/$SV.plist"
+echo "  (a grant only takes effect in a freshly started agent)"
 echo
 echo "  On macOS 15 and later, Screen Recording approval EXPIRES and re-prompts"
 echo "  periodically. On a fleet, deploy an MDM PPPC configuration profile instead"

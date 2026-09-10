@@ -1402,6 +1402,148 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
 }
 
 
+// ---- Interactive permission walkthrough (-requestperms) --------------------
+//
+// Run by the installer, in the console user's Aqua session, so every grant the
+// agent needs is asked for WHILE INSTALLING instead of the first time someone
+// opens a remote session.
+//
+// The mechanic that matters: a program only appears in a Privacy pane once tccd
+// has a record for it. Opening the Screen Recording pane before that just shows
+// an empty list (observed 2026-09-09). And CGRequestScreenCaptureAccess() does
+// NOT create that record here -- tccd answers "Service kTCCServiceScreenCapture
+// does not allow prompting; returning denied" -- besides re-triggering a
+// recurring permission banner even when the grant already exists (see kvm_init).
+// What does register the program, and raises Apple's own "... would like to
+// record this screen" dialog, is ATTEMPTING A REAL CAPTURE. So each step
+// performs the actual operation and lets macOS raise its own dialog; the
+// System Settings pane is only ever a fallback.
+//
+// Steps are also sequential and user-paced: opening a pane while another
+// dialog is pending steals focus and hides it (that is what masked the
+// Accessibility prompt).
+
+static void perm_open_pane(const char *anchor)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "x-apple.systempreferences:com.apple.preference.security?%s", anchor);
+    CFStringRef u = CFStringCreateWithCString(NULL, url, kCFStringEncodingASCII);
+    if (!u) return;
+    CFURLRef p = CFURLCreateWithString(NULL, u, NULL);
+    if (p) { LSOpenCFURLRef(p, NULL); CFRelease(p); }
+    CFRelease(u);
+}
+
+// Read a line from the controlling terminal. stdin is unusable here: the
+// installer is normally run as `curl ... | sudo bash`, so stdin is the script.
+// Returns 0 when there is no tty (non-interactive install) so callers can skip.
+static int perm_ask(const char *prompt, char *out, size_t outsz)
+{
+    FILE *tty = fopen("/dev/tty", "r+");
+    if (!tty) return 0;
+    fputs(prompt, tty); fflush(tty);
+    if (fgets(out, (int)outsz, tty) == NULL) { fclose(tty); return 0; }
+    fclose(tty);
+    return 1;
+}
+
+static int perm_has_accessibility(void) { return AXIsProcessTrusted() ? 1 : 0; }
+
+static int perm_has_screencapture(void)
+{
+    if (__builtin_available(macOS 10.15, *)) return CGPreflightScreenCaptureAccess() ? 1 : 0;
+    return 1;
+}
+
+static int perm_has_fda(void) { return _fullDiskAuthorizationStatus() == MPAuthorizationStatusAuthorized; }
+
+// Poll until granted or the user gives up. Returns 1 if granted.
+static int perm_wait(const char *label, int (*check)(void), const char *pane)
+{
+    char buf[32];
+    for (;;)
+    {
+        if (check()) { printf("      -> %s granted\n", label); return 1; }
+        printf("      Grant it, then press Return here.\n");
+        if (!perm_ask("      [Return]=recheck  o=open System Settings  s=skip : ", buf, sizeof(buf)))
+        {
+            printf("      (no terminal available -- skipping %s)\n", label);
+            return 0;
+        }
+        if (buf[0] == 's' || buf[0] == 'S') { printf("      -> %s SKIPPED\n", label); return 0; }
+        if (buf[0] == 'o' || buf[0] == 'O') { perm_open_pane(pane); continue; }
+        if (check()) { printf("      -> %s granted\n", label); return 1; }
+        printf("      still not granted.\n");
+    }
+}
+
+// wantFDA: ask about Full Disk Access too (it is optional -- only needed for
+// pushing/downloading files into protected locations on the managed Mac).
+void kvm_request_permissions_interactive(int wantFDA)
+{
+    printf("\n=== MeshAgent: granting macOS privacy permissions ===\n");
+    printf("Two permissions are required, one is optional. Each step raises a dialog\n");
+    printf("(or opens System Settings); grant it there, then come back here.\n\n");
+
+    // [1] Accessibility -- remote keyboard/mouse in the logged-in session.
+    // AXIsProcessTrustedWithOptions raises Apple's own dialog, whose "Open
+    // System Settings" button lands on the right pane WITH this program listed.
+    printf("[1/3] Accessibility  (required: remote keyboard & mouse in-session)\n");
+    if (perm_has_accessibility()) { printf("      -> already granted\n"); }
+    else
+    {
+        if (__builtin_available(macOS 10.9, *))
+        {
+            const void *k[] = { kAXTrustedCheckOptionPrompt };
+            const void *v[] = { kCFBooleanTrue };
+            CFDictionaryRef o = CFDictionaryCreate(kCFAllocatorDefault, k, v, 1,
+                &kCFCopyStringDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            AXIsProcessTrustedWithOptions(o);
+            CFRelease(o);
+        }
+        perm_wait("Accessibility", perm_has_accessibility, "Privacy_Accessibility");
+    }
+
+    // [2] Screen Recording -- the remote screen. Attempt a REAL capture so tccd
+    // registers this program and macOS raises its own dialog; without this the
+    // Screen Recording pane lists nothing to toggle.
+    printf("\n[2/3] Screen Recording  (required: the remote screen)\n");
+    if (perm_has_screencapture()) { printf("      -> already granted\n"); }
+    else
+    {
+        printf("      requesting a screen capture so macOS shows its dialog...\n");
+        extern CGImageRef kvm_capture_sck(uint32_t displayID);
+        CGImageRef probe = kvm_capture_sck((uint32_t)CGMainDisplayID());
+        if (probe) CGImageRelease(probe);
+        perm_wait("Screen Recording", perm_has_screencapture, "Privacy_ScreenCapture");
+    }
+
+    // [3] Full Disk Access -- optional. There is no API to prompt for it, so the
+    // pane is the only route; we probe readability of protected files to detect it.
+    printf("\n[3/3] Full Disk Access  (optional: file transfer to protected locations)\n");
+    if (!wantFDA) { printf("      -> not requested\n"); }
+    else if (perm_has_fda()) { printf("      -> already granted\n"); }
+    else
+    {
+        char ans[32];
+        printf("      Needed only to push/download files into protected folders\n");
+        printf("      (Desktop, Documents, Downloads, Mail, etc.) on this Mac.\n");
+        if (perm_ask("      Grant Full Disk Access now? [y/N]: ", ans, sizeof(ans))
+            && (ans[0] == 'y' || ans[0] == 'Y'))
+        {
+            perm_open_pane("Privacy_AllFiles");
+            printf("      Add and enable this program in the list that opened.\n");
+            perm_wait("Full Disk Access", perm_has_fda, "Privacy_AllFiles");
+        }
+        else { printf("      -> skipped (can be granted later in System Settings)\n"); }
+    }
+
+    printf("\n=== permissions step complete ===\n");
+    printf("  Accessibility   : %s\n", perm_has_accessibility() ? "granted" : "NOT granted");
+    printf("  Screen Recording: %s\n", perm_has_screencapture() ? "granted" : "NOT granted");
+    printf("  Full Disk Access: %s\n\n", perm_has_fda() ? "granted" : "not granted (optional)");
+}
+
 void kvm_check_permission()
 {
 

@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..f6f2b91 100644
+index b70a508..aa3b75e 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -42,7 +42,39 @@ index b70a508..f6f2b91 100644
  #ifdef WIN32
  	int argvi, argvsz;
  	char **argv = (char**)ILibMemory_SmartAllocate(argc * sizeof(void*));
-@@ -327,8 +339,114 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -303,6 +315,31 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+ 		kvm_server_mainloop((void*)(uint64_t)getpid());
+ 		return 0;
+ 	}
++	// Interactive permission walkthrough, run by the installer in the console
++	// user's Aqua session so all grants are requested during the install rather
++	// than the first time someone opens a remote session.
++	//   -requestperms        Accessibility + Screen Recording (Full Disk Access offered)
++	//   -requestperms nofda  skip the Full Disk Access step entirely
++	// Must run as the console user: TCC attributes the grant to the process's
++	// path, and the grants have to land on this binary in the user's session.
++	else if (argc > 1 && strcasecmp(argv[1], "-requestperms") == 0)
++	{
++		extern void kvm_request_permissions_interactive(int wantFDA);
++		int wantFDA = !(argc > 2 && argv[2] != NULL && strcasecmp(argv[2], "nofda") == 0);
++		if (getuid() == 0)
++		{
++			printf("-requestperms must run as the console user, not root.\n");
++			return 1;
++		}
++		// Join the user's GUI audit session so the capture probe in step 2 can
++		// reach the WindowServer and raise Apple's Screen Recording dialog.
++		{
++			extern int ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(uid_t uid);
++			ILibProcessPipe_JoinUserAuditSession_OSX_PostExec(getuid());
++		}
++		kvm_request_permissions_interactive(wantFDA);
++		return 0;
++	}
+ 	else if (argc > 1 && strcasecmp(argv[1], "-kvmagent") == 0)
+ 	{
+ 		// User-context LaunchAgent mode: long-running KVM server that
+@@ -327,8 +364,88 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
  			kvm_set_listener_path(defaultPath);
  		}
@@ -96,40 +128,14 @@ index b70a508..f6f2b91 100644
 +				CFRelease(_opts);
 +			}
 +		}
-+		// Ask for Screen Recording at STARTUP too (Aqua only), so every grant the
-+		// agent needs is requested while the installer is running -- the installer
-+		// bootstraps this LaunchAgent into the console user's session, so this runs
-+		// during the install. Previously nothing requested ScreenCapture at all:
-+		// kvm_check_permission() lives in agentcore.c and is guarded to uid != 0,
-+		// but only the ROOT daemon reaches it, so it never fired; and this
-+		// -kvmagent path only asked for Accessibility. The Screen Recording dialog
-+		// therefore appeared later, the first time a Desktop session actually
-+		// captured -- i.e. the installing admin had to open a remote session
-+		// before macOS would even ask.
-+		//
-+		// Two steps, because a prompt alone is not dependable: tccd refuses to
-+		// prompt for kTCCServiceScreenCapture in some contexts ("does not allow
-+		// prompting; returning denied"), so if the grant still is not there we
-+		// open the Screen Recording pane directly -- same approach this codebase
-+		// already uses for Full Disk Access in kvm_check_permission().
-+		if (getuid() != 0 && __builtin_available(macOS 10.15, *))
-+		{
-+			extern bool CGPreflightScreenCaptureAccess(void);
-+			extern bool CGRequestScreenCaptureAccess(void);
-+			if (!CGPreflightScreenCaptureAccess())
-+			{
-+				CGRequestScreenCaptureAccess();
-+				if (!CGPreflightScreenCaptureAccess())
-+				{
-+					CFStringRef _u = CFSTR("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
-+					CFURLRef _p = CFURLCreateWithString(NULL, _u, NULL);
-+					if (_p) { LSOpenCFURLRef(_p, NULL); CFRelease(_p); }
-+				}
-+			}
-+			FILE *_sf = fopen("/tmp/kvm_debug.log", "a");
-+			if (_sf) { fprintf(_sf, "ScreenCapture preflight=%d after startup request (uid=%d)\n",
-+			                   (int)CGPreflightScreenCaptureAccess(), (int)getuid()); fclose(_sf); }
-+		}
++		// NOTE: deliberately no CGRequestScreenCaptureAccess() here.
++		// It does not register this program with tccd ("Service
++		// kTCCServiceScreenCapture does not allow prompting; returning denied"),
++		// so opening the Screen Recording pane afterwards showed an EMPTY list,
++		// and it re-triggers a recurring permission banner even when the grant
++		// already exists (see the note in kvm_init). Screen Recording is asked
++		// for by the installer instead, via `-requestperms`, which attempts a
++		// real capture so macOS raises its own dialog.
 +		// Poll for Accessibility permission in a background thread. When
 +		// the user grants it after the prompt, exit with a non-zero code so
 +		// launchd restarts the process — the fresh process will start with
@@ -1725,7 +1731,7 @@ index d6bb534..adf87a7 100644
  
  #endif /* LINUX_EVENTS_H_ */
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..217b5e0 100644
+index 6d57690..e2270be 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -1987,7 +1993,9 @@ index 6d57690..217b5e0 100644
 +		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 +		CGImageRef image = NULL;
 +		if (getuid() == 0)
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
 +			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
 +			// back to the standard CoreGraphics capture APIs: on a PHYSICAL Mac (not
@@ -2010,9 +2018,7 @@ index 6d57690..217b5e0 100644
 +			}
 +		}
 +		else
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
 +			// display directly instead of compositing the window list, and measured
 +			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
@@ -2204,7 +2210,156 @@ index 6d57690..217b5e0 100644
  	}
  }
  
-@@ -1190,4 +1442,45 @@ void kvm_check_permission()
+@@ -1150,6 +1402,148 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+ }
+ 
+ 
++// ---- Interactive permission walkthrough (-requestperms) --------------------
++//
++// Run by the installer, in the console user's Aqua session, so every grant the
++// agent needs is asked for WHILE INSTALLING instead of the first time someone
++// opens a remote session.
++//
++// The mechanic that matters: a program only appears in a Privacy pane once tccd
++// has a record for it. Opening the Screen Recording pane before that just shows
++// an empty list (observed 2026-09-09). And CGRequestScreenCaptureAccess() does
++// NOT create that record here -- tccd answers "Service kTCCServiceScreenCapture
++// does not allow prompting; returning denied" -- besides re-triggering a
++// recurring permission banner even when the grant already exists (see kvm_init).
++// What does register the program, and raises Apple's own "... would like to
++// record this screen" dialog, is ATTEMPTING A REAL CAPTURE. So each step
++// performs the actual operation and lets macOS raise its own dialog; the
++// System Settings pane is only ever a fallback.
++//
++// Steps are also sequential and user-paced: opening a pane while another
++// dialog is pending steals focus and hides it (that is what masked the
++// Accessibility prompt).
++
++static void perm_open_pane(const char *anchor)
++{
++    char url[256];
++    snprintf(url, sizeof(url), "x-apple.systempreferences:com.apple.preference.security?%s", anchor);
++    CFStringRef u = CFStringCreateWithCString(NULL, url, kCFStringEncodingASCII);
++    if (!u) return;
++    CFURLRef p = CFURLCreateWithString(NULL, u, NULL);
++    if (p) { LSOpenCFURLRef(p, NULL); CFRelease(p); }
++    CFRelease(u);
++}
++
++// Read a line from the controlling terminal. stdin is unusable here: the
++// installer is normally run as `curl ... | sudo bash`, so stdin is the script.
++// Returns 0 when there is no tty (non-interactive install) so callers can skip.
++static int perm_ask(const char *prompt, char *out, size_t outsz)
++{
++    FILE *tty = fopen("/dev/tty", "r+");
++    if (!tty) return 0;
++    fputs(prompt, tty); fflush(tty);
++    if (fgets(out, (int)outsz, tty) == NULL) { fclose(tty); return 0; }
++    fclose(tty);
++    return 1;
++}
++
++static int perm_has_accessibility(void) { return AXIsProcessTrusted() ? 1 : 0; }
++
++static int perm_has_screencapture(void)
++{
++    if (__builtin_available(macOS 10.15, *)) return CGPreflightScreenCaptureAccess() ? 1 : 0;
++    return 1;
++}
++
++static int perm_has_fda(void) { return _fullDiskAuthorizationStatus() == MPAuthorizationStatusAuthorized; }
++
++// Poll until granted or the user gives up. Returns 1 if granted.
++static int perm_wait(const char *label, int (*check)(void), const char *pane)
++{
++    char buf[32];
++    for (;;)
++    {
++        if (check()) { printf("      -> %s granted\n", label); return 1; }
++        printf("      Grant it, then press Return here.\n");
++        if (!perm_ask("      [Return]=recheck  o=open System Settings  s=skip : ", buf, sizeof(buf)))
++        {
++            printf("      (no terminal available -- skipping %s)\n", label);
++            return 0;
++        }
++        if (buf[0] == 's' || buf[0] == 'S') { printf("      -> %s SKIPPED\n", label); return 0; }
++        if (buf[0] == 'o' || buf[0] == 'O') { perm_open_pane(pane); continue; }
++        if (check()) { printf("      -> %s granted\n", label); return 1; }
++        printf("      still not granted.\n");
++    }
++}
++
++// wantFDA: ask about Full Disk Access too (it is optional -- only needed for
++// pushing/downloading files into protected locations on the managed Mac).
++void kvm_request_permissions_interactive(int wantFDA)
++{
++    printf("\n=== MeshAgent: granting macOS privacy permissions ===\n");
++    printf("Two permissions are required, one is optional. Each step raises a dialog\n");
++    printf("(or opens System Settings); grant it there, then come back here.\n\n");
++
++    // [1] Accessibility -- remote keyboard/mouse in the logged-in session.
++    // AXIsProcessTrustedWithOptions raises Apple's own dialog, whose "Open
++    // System Settings" button lands on the right pane WITH this program listed.
++    printf("[1/3] Accessibility  (required: remote keyboard & mouse in-session)\n");
++    if (perm_has_accessibility()) { printf("      -> already granted\n"); }
++    else
++    {
++        if (__builtin_available(macOS 10.9, *))
++        {
++            const void *k[] = { kAXTrustedCheckOptionPrompt };
++            const void *v[] = { kCFBooleanTrue };
++            CFDictionaryRef o = CFDictionaryCreate(kCFAllocatorDefault, k, v, 1,
++                &kCFCopyStringDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++            AXIsProcessTrustedWithOptions(o);
++            CFRelease(o);
++        }
++        perm_wait("Accessibility", perm_has_accessibility, "Privacy_Accessibility");
++    }
++
++    // [2] Screen Recording -- the remote screen. Attempt a REAL capture so tccd
++    // registers this program and macOS raises its own dialog; without this the
++    // Screen Recording pane lists nothing to toggle.
++    printf("\n[2/3] Screen Recording  (required: the remote screen)\n");
++    if (perm_has_screencapture()) { printf("      -> already granted\n"); }
++    else
++    {
++        printf("      requesting a screen capture so macOS shows its dialog...\n");
++        extern CGImageRef kvm_capture_sck(uint32_t displayID);
++        CGImageRef probe = kvm_capture_sck((uint32_t)CGMainDisplayID());
++        if (probe) CGImageRelease(probe);
++        perm_wait("Screen Recording", perm_has_screencapture, "Privacy_ScreenCapture");
++    }
++
++    // [3] Full Disk Access -- optional. There is no API to prompt for it, so the
++    // pane is the only route; we probe readability of protected files to detect it.
++    printf("\n[3/3] Full Disk Access  (optional: file transfer to protected locations)\n");
++    if (!wantFDA) { printf("      -> not requested\n"); }
++    else if (perm_has_fda()) { printf("      -> already granted\n"); }
++    else
++    {
++        char ans[32];
++        printf("      Needed only to push/download files into protected folders\n");
++        printf("      (Desktop, Documents, Downloads, Mail, etc.) on this Mac.\n");
++        if (perm_ask("      Grant Full Disk Access now? [y/N]: ", ans, sizeof(ans))
++            && (ans[0] == 'y' || ans[0] == 'Y'))
++        {
++            perm_open_pane("Privacy_AllFiles");
++            printf("      Add and enable this program in the list that opened.\n");
++            perm_wait("Full Disk Access", perm_has_fda, "Privacy_AllFiles");
++        }
++        else { printf("      -> skipped (can be granted later in System Settings)\n"); }
++    }
++
++    printf("\n=== permissions step complete ===\n");
++    printf("  Accessibility   : %s\n", perm_has_accessibility() ? "granted" : "NOT granted");
++    printf("  Screen Recording: %s\n", perm_has_screencapture() ? "granted" : "NOT granted");
++    printf("  Full Disk Access: %s\n\n", perm_has_fda() ? "granted" : "not granted (optional)");
++}
++
+ void kvm_check_permission()
+ {
+ 
+@@ -1190,4 +1584,45 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }
