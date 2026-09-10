@@ -107,7 +107,26 @@ chown root:wheel "/Library/LaunchAgents/$SV.plist"; chmod 644 "/Library/LaunchAg
 # put it back instead of leaving legacy VNC + a password enabled forever.
 PRESTATE="$D/kvm/prestate.env"
 if [ ! -f "$PRESTATE" ]; then
-    if /bin/launchctl print system/com.apple.screensharing >/dev/null 2>&1; then
+    # Whether Screen Sharing was ALREADY on. Getting this right matters: if we
+    # record "on" when it was off, uninstall leaves Screen Sharing + legacy VNC
+    # enabled on a machine that never had them -- the exact thing this prestate
+    # file exists to prevent.
+    #
+    # Two tests that look right and are NOT (both measured 2026-09-09, clean Tahoe
+    # 26.6.2 VM):
+    #   - `launchctl print system/com.apple.screensharing` exit status: always 0,
+    #     because that system LaunchDaemon is always *registered* even when off.
+    #     This is the bug that recorded PRIOR_SS=on unconditionally.
+    #   - grepping its output for `state = running`: the job is socket-activated,
+    #     so it reads `state = not running` while Screen Sharing is fully enabled
+    #     and serving (:5900 listening). Also emits several nested `state = active`
+    #     lines, so a bare `state =` grep is ambiguous.
+    #   - `launchctl print-disabled system` reports "enabled" even when off.
+    #
+    # What actually tracks it: is anything LISTENING on :5900 (0 before enabling,
+    # non-zero after).
+    if [ -x /usr/sbin/lsof ] && \
+       [ "$(/usr/sbin/lsof -nP -iTCP:5900 -sTCP:LISTEN 2>/dev/null | /usr/bin/grep -c LISTEN)" -gt 0 ]; then
         PRIOR_SS=on; else PRIOR_SS=off; fi
     PRIOR_LEGACY="$(/usr/bin/defaults read /Library/Preferences/com.apple.RemoteManagement \
                     VNCLegacyConnectionsEnabled 2>/dev/null || echo 0)"
@@ -254,9 +273,17 @@ fi
 echo "MeshAgent installed for group '$MESH_NAME' ($(uname -m))."
 
 # ---- post-install verification ------------------------------------------
-# Everything below is checkable without Full Disk Access. The TCC grants
-# themselves are NOT readable (the system TCC.db is closed even to root), so
-# those are reported as manual steps rather than guessed at.
+# Everything below is checkable without Full Disk Access, so the installer never
+# needs FDA itself.
+#
+# The TCC grants are NOT checked here. Note the precise reason: the system TCC.db
+# is not "closed even to root" -- SIP makes it read-ONLY, but a root process whose
+# *responsible* process holds Full Disk Access can read it (measured 2026-09-09:
+# `sqlite3 .../TCC.db "select ..."` over ssh succeeds, because
+# /usr/libexec/sshd-keygen-wrapper has kTCCServiceSystemPolicyAllFiles). An
+# installer run from a plain Terminal generally does NOT have that, and writing is
+# blocked outright by SIP regardless. So the grants are reported as manual steps
+# rather than probed or pre-seeded.
 echo
 echo "--- checks ---"
 if /bin/launchctl print system/com.apple.screensharing >/dev/null 2>&1; then

@@ -893,6 +893,48 @@ static void vnc_inject_key(CGKeyCode adb, int down)
     }
 }
 
+// Send a Unicode CHARACTER (not a keycode) to screensharingd as an RFB KeyEvent.
+//
+// MeshCentral's default viewer mode ("Use Remote Keyboard Map" OFF) sends printable
+// characters ONLY as MNG_KVM_KEY_UNICODE(85) -- keydown sends nothing, keypress/keyup
+// carry the character. Non-printables (Enter, Tab, arrows, modifiers) still arrive as
+// MNG_KVM_KEY(1). So at the login window we must handle the Unicode path too, or
+// letters and digits are silently dropped and the password field stays empty.
+//
+// Mapping a character straight to a keysym is also MORE correct than the
+// vk -> ADB -> shifted-keysym round trip used by vnc_inject_key(): it carries the
+// character the operator actually typed, independent of either keyboard layout.
+// X11/RFB rule: Latin-1 (0x20-0x7E, 0xA0-0xFF) is the codepoint itself; anything
+// else uses the Unicode form 0x01000000 + codepoint.
+static void vnc_inject_unicode(uint16_t unicode, int down)
+{
+    if (g_vnc_fd < 0) {
+        time_t now = time(NULL);
+        if ((now - g_vnc_last_attempt) < 5) return;
+        if (!vnc_connect()) return;
+    }
+
+    uint32_t sym;
+    if ((unicode >= 0x20 && unicode <= 0x7E) || (unicode >= 0xA0 && unicode <= 0xFF))
+        sym = unicode;
+    else
+        sym = 0x01000000u + (uint32_t)unicode;
+
+    uint8_t msg[8];
+    msg[0] = 4;                     // RFB KeyEvent
+    msg[1] = down ? 1 : 0;
+    msg[2] = 0; msg[3] = 0;
+    msg[4] = (sym >> 24) & 0xFF;
+    msg[5] = (sym >> 16) & 0xFF;
+    msg[6] = (sym >>  8) & 0xFF;
+    msg[7] = (sym      ) & 0xFF;
+
+    if (vnc_write_all(g_vnc_fd, msg, 8) < 0) {
+        write(STDOUT_FILENO, "vnc_uni: send failed, disconnecting\n", 36);
+        vnc_disconnect();
+    }
+}
+
 // (g_vnc_btnmask is declared near the top with the other VNC state: bit0=left,
 // bit1=middle, bit2=right, bit3=wheelUp, bit4=wheelDown. RFB PointerEvents
 // carry a mask, not up/down transitions.)
@@ -1428,6 +1470,23 @@ static unsigned char unicode_to_vk(uint16_t u, int *out_shift)
 
 void KeyActionUnicode(uint16_t unicode, int up)
 {
+    // At the login window, route the character through screensharingd/VNC.
+    //
+    // This used to `return` further down, on the theory that "MeshCentral sends both" a
+    // keycode and a Unicode event so injecting here would double every character.
+    // Measured against agent-desktop-0.0.2.js (2026-09-09) that is NOT true: for a
+    // printable key with no Ctrl/Alt/Meta and "Use Remote Keyboard Map" OFF (the
+    // DEFAULT), xxKeyDown sends nothing and only xxKeyPress/xxKeyUp fire, as Unicode.
+    // The two paths are mutually exclusive, so returning dropped every letter and digit
+    // at the login window -- which is why users had to tick "Use Remote Keyboard Map"
+    // just to type a password.
+    //
+    // Done FIRST, before the vk/keymap lookup below: that lookup bails out for any
+    // character outside the US-layout vk table (accented characters, for one), and
+    // vnc_inject_unicode() needs no vk -- it maps the codepoint straight to a keysym.
+    // Must also stay before AVP: AVP steal succeeds at loginwindow but sendReport fails.
+    if (is_loginwindow()) { vnc_inject_unicode(unicode, up ? 0 : 1); return; }
+
     int need_shift = 0;
     unsigned char vk = unicode_to_vk(unicode, &need_shift);
     if (!vk) {
@@ -1447,10 +1506,7 @@ void KeyActionUnicode(uint16_t unicode, int up)
     }
     if (i == g_keymapLen) return;
 
-    // At loginwindow, VNC injection is handled exclusively by inject_key() via KeyAction.
-    // Suppress Unicode injection here to avoid double characters (MeshCentral sends both).
-    // Must check before AVP: AVP steal succeeds at loginwindow but sendReport fails.
-    if (is_loginwindow()) return;
+    // (login-window Unicode routing is handled at the top of this function)
     if (g_avp_kbd_conn != IO_OBJECT_NULL) { if (avp_kbd_key(keycode, !up)) return; }
     if (g_kbd_dev) { hidd_key(keycode, !up); return; }
     dispatch_once_f(&g_postOnce, NULL, post_init_once);
