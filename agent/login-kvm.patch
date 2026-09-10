@@ -187,10 +187,10 @@ index b70a508..b6d96b5 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..cd8386c 100644
+index c27e1f0..d667d8c 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,1109 @@
+@@ -2,13 +2,1136 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -990,6 +990,33 @@ index c27e1f0..cd8386c 100644
 +        printf("      (could not reach Screen Sharing on 127.0.0.1:5900)\n");
 +        return;
 +    }
++
++    // The handshake alone is not enough: it covers CAPTURE only.
++    //
++    // Measured 2026-09-10, install-time probe vs first pre-login connect:
++    //     13:06:04  kTCCServiceScreenCapture|com.apple.screensharing.agent  <- the probe
++    //     13:12:55  kTCCServicePostEvent    |com.apple.screensharing.agent  <- still ambushed
++    // ScreensharingAgent asks about controlling the screen separately, and only
++    // once something actually sends it an input event -- which a handshake-only
++    // probe never does, but the agent does the moment it drives the login window.
++    //
++    // So send one real KeyEvent. Shift alone is the safe choice: it is a
++    // genuine input event, but pressing and releasing a bare modifier produces
++    // no character and has no side effect, which matters because the operator
++    // is sitting in a terminal running the installer while this happens.
++    {
++        const uint32_t XK_Shift_L = 0xFFE1u;
++        uint8_t msg[8];
++        for (int down = 1; down >= 0; down--)
++        {
++            msg[0] = 4; msg[1] = (uint8_t)down; msg[2] = 0; msg[3] = 0;
++            msg[4] = (XK_Shift_L >> 24) & 0xFF; msg[5] = (XK_Shift_L >> 16) & 0xFF;
++            msg[6] = (XK_Shift_L >>  8) & 0xFF; msg[7] = (XK_Shift_L      ) & 0xFF;
++            if (vnc_write_all(g_vnc_fd, msg, 8) < 0) break;
++            usleep(150000);
++        }
++    }
++
 +    sleep(3);
 +    vnc_disconnect();
 +}
@@ -1303,7 +1330,7 @@ index c27e1f0..cd8386c 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1228,324 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1255,324 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
