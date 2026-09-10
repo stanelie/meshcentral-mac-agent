@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..d403f67 100644
+index b70a508..f6f2b91 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -42,7 +42,7 @@ index b70a508..d403f67 100644
  #ifdef WIN32
  	int argvi, argvsz;
  	char **argv = (char**)ILibMemory_SmartAllocate(argc * sizeof(void*));
-@@ -327,8 +339,80 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -327,8 +339,114 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
  			kvm_set_listener_path(defaultPath);
  		}
@@ -95,6 +95,40 @@ index b70a508..d403f67 100644
 +				AXIsProcessTrustedWithOptions(_opts);
 +				CFRelease(_opts);
 +			}
++		}
++		// Ask for Screen Recording at STARTUP too (Aqua only), so every grant the
++		// agent needs is requested while the installer is running -- the installer
++		// bootstraps this LaunchAgent into the console user's session, so this runs
++		// during the install. Previously nothing requested ScreenCapture at all:
++		// kvm_check_permission() lives in agentcore.c and is guarded to uid != 0,
++		// but only the ROOT daemon reaches it, so it never fired; and this
++		// -kvmagent path only asked for Accessibility. The Screen Recording dialog
++		// therefore appeared later, the first time a Desktop session actually
++		// captured -- i.e. the installing admin had to open a remote session
++		// before macOS would even ask.
++		//
++		// Two steps, because a prompt alone is not dependable: tccd refuses to
++		// prompt for kTCCServiceScreenCapture in some contexts ("does not allow
++		// prompting; returning denied"), so if the grant still is not there we
++		// open the Screen Recording pane directly -- same approach this codebase
++		// already uses for Full Disk Access in kvm_check_permission().
++		if (getuid() != 0 && __builtin_available(macOS 10.15, *))
++		{
++			extern bool CGPreflightScreenCaptureAccess(void);
++			extern bool CGRequestScreenCaptureAccess(void);
++			if (!CGPreflightScreenCaptureAccess())
++			{
++				CGRequestScreenCaptureAccess();
++				if (!CGPreflightScreenCaptureAccess())
++				{
++					CFStringRef _u = CFSTR("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture");
++					CFURLRef _p = CFURLCreateWithString(NULL, _u, NULL);
++					if (_p) { LSOpenCFURLRef(_p, NULL); CFRelease(_p); }
++				}
++			}
++			FILE *_sf = fopen("/tmp/kvm_debug.log", "a");
++			if (_sf) { fprintf(_sf, "ScreenCapture preflight=%d after startup request (uid=%d)\n",
++			                   (int)CGPreflightScreenCaptureAccess(), (int)getuid()); fclose(_sf); }
 +		}
 +		// Poll for Accessibility permission in a background thread. When
 +		// the user grants it after the prompt, exit with a non-zero code so
