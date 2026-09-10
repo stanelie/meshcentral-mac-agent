@@ -1,13 +1,27 @@
 # Building the agent binaries
 
-The changes live in `meshcore/KVM/MacOS/mac_events.c` (login-window input routing + the HID
-init that's macOS-11-safe) and `meshcore/KVM/MacOS/mac_kvm.c` (login-window video capture with
-a CoreGraphics fallback for macOS < 14), plus a one-line makefile tweak. Everything else is
-stock [Ylianst/MeshAgent](https://github.com/Ylianst/MeshAgent).
+The changes touch eight files. Everything else is stock
+[Ylianst/MeshAgent](https://github.com/Ylianst/MeshAgent).
+
+| file | what it carries |
+|---|---|
+| `meshcore/KVM/MacOS/mac_events.c` | login-window input routing, private-event-source modifier state, macOS-11-safe HID init |
+| `meshcore/KVM/MacOS/mac_events.h` | declaration for the above |
+| `meshcore/KVM/MacOS/mac_kvm.c` | login-window video capture (CoreGraphics fallback for macOS < 14), stale-session cleanup, the `-requestperms` walkthrough |
+| `meshcore/KVM/MacOS/mac_kvm_sck.m` | ScreenCaptureKit capture path (macOS 14+; compiled out on older SDKs) |
+| `meshconsole/main.c` | `-kvmagent` and `-requestperms` entry points |
+| `meshcore/agentcore.c` | KVM session plumbing |
+| `microstack/ILibProcessPipe.c` | `ILibProcessPipe_JoinWindowServerAuditSession_OSX` |
+| `makefile` | builds `mac_kvm_sck.m`, links ScreenCaptureKit |
 
 ## What's here
-- `mac_events.c`, `mac_kvm.c` — the full modified files (drop-in replacements).
-- `login-kvm.patch` — the exact diff vs the upstream base (both files), for review / upstream PR.
+- `mac_events.c`, `mac_kvm.c`, `mac_kvm_sck.m` — full modified files (drop-in replacements).
+- `login-kvm.patch` — the exact diff vs the upstream base, covering **all eight** files.
+  This is the authoritative, complete form of the change; the three drop-ins above are a
+  subset and are **not** sufficient on their own. Building from drop-ins alone fails with
+  `hid_inject_init` undeclared and `ILibProcessPipe_JoinWindowServerAuditSession_OSX`
+  undefined, because `mac_events.h`, `main.c`, `agentcore.c`, `ILibProcessPipe.c` and the
+  makefile only exist in the patch.
 - `kvm_input_harness.c` — a standalone validation tool (see bottom).
 
 ## Build (on a Mac with the Xcode command-line tools)
@@ -17,15 +31,17 @@ git clone https://github.com/Ylianst/MeshAgent
 cd MeshAgent
 git checkout cb62daa82b6f23dd317eac77a16a398db03f43ea   # upstream base this patch targets
 
-# apply our changes — either drop in the files:
-cp /path/to/agent/mac_events.c meshcore/KVM/MacOS/mac_events.c
-cp /path/to/agent/mac_kvm.c    meshcore/KVM/MacOS/mac_kvm.c
-# ...or apply the patch (covers both files):
-#   git apply /path/to/agent/login-kvm.patch
+# apply our changes — the patch is required (it carries all eight files):
+git apply /path/to/agent/login-kvm.patch
+
+# The drop-ins are byte-identical to what the patch produces; copying them over
+# afterwards is a no-op, and is only useful when editing them as the source of
+# truth and regenerating the patch:
+#   cp /path/to/agent/mac_{events.c,kvm.c,kvm_sck.m} meshcore/KVM/MacOS/
 
 # Apple Silicon (arm64), agent id 29:
 make macos ARCHID=29
-codesign -f -s - --identifier meshagent_osx-arm-64 meshagent_osx-arm-64
+codesign -f -s - --identifier meshagent_osx-arm-64 meshagent_osx-arm-64   # local test only — see below
 
 # Intel (x86_64), agent id 16 — clear stale .o first, force the arch:
 find microstack microscript meshcore meshconsole -name '*.o' -delete

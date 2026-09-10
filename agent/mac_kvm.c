@@ -37,6 +37,7 @@ limitations under the License.
 #include <string.h>
 #include <pwd.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 
 // Temporary diagnostic log for loginwindow KVM debugging
 static void kvm_flog(const char *fmt, ...) {
@@ -1449,7 +1450,16 @@ static int perm_ask(const char *prompt, char *out, size_t outsz)
     if (isatty(STDIN_FILENO))
     {
         printf("%s", prompt); fflush(stdout);
-        if (fgets(out, (int)outsz, stdin) != NULL) return 1;
+        // fgets() also returns NULL when the read is merely interrupted (a
+        // dialog going up mid-read did exactly that, and step 1 "skipped"
+        // itself while later steps read the same fd fine). Only a real EOF
+        // means there is nobody there.
+        for (int tries = 0; tries < 5; tries++)
+        {
+            if (fgets(out, (int)outsz, stdin) != NULL) return 1;
+            if (feof(stdin)) return 0;
+            clearerr(stdin);
+        }
         return 0;
     }
     FILE *tty = fopen("/dev/tty", "r+");
@@ -1481,26 +1491,90 @@ static int perm_ask(const char *prompt, char *out, size_t outsz)
 // on accept the agent runs kvm_init() and its capture loop. So connect to that
 // socket ourselves, hold it briefly, and drop it. Who connects is irrelevant to
 // TCC: the capture is performed by the agent process, which is what tccd judges.
-static void perm_fake_kvm_session(void)
+
+// One connect() attempt against the agent's session socket. Returns the fd, or -1.
+static int perm_connect_agent(void)
 {
     char path[128];
     snprintf(path, sizeof(path), "/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
-
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { printf("      (could not open a socket)\n"); return; }
+    if (fd < 0) return -1;
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
     strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
-    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0)
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+// Bring the agent back NOW.
+//
+// Closing a session makes the agent exit, and its LaunchAgent sets
+// ThrottleInterval=30 -- so launchd waits half a minute before respawning.
+// Measured 2026-09-10: after a session closed, the socket was still dead 40s
+// later, which is what produced both "agent socket not reachable" and the
+// "still not granted" loop (the walkthrough was reading a stale log while the
+// agent was simply down). `launchctl kickstart -k` bypasses the throttle;
+// measured 13s to a fresh, listening agent.
+static void perm_kickstart_agent(void)
+{
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd),
+             "/bin/launchctl kickstart -k gui/%u/meshagent-launchagent >/dev/null 2>&1",
+             (unsigned)getuid());
+    (void)system(cmd);
+}
+
+// Is the agent process alive? Asked of launchd, never by connecting.
+//
+// A connection to that socket IS a session, and dropping one makes the agent
+// exit -- so "probe by connect, then close" destroys the very thing it just
+// found. Measured 2026-09-10: a wait loop built that way reported the agent up
+// and the next connect() immediately failed, because the probe had killed it.
+// Do not test it with `nc -z -U` either: that reports failure against a live
+// listener, and the socket FILE outlives the process, so its presence proves
+// nothing.
+static int perm_agent_running(void)
+{
+    FILE *f = popen("/bin/launchctl list meshagent-launchagent 2>/dev/null", "r");
+    if (!f) return 0;
+    char line[512];
+    int running = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strstr(line, "\"PID\"") != NULL) { running = 1; break; }
+    pclose(f);
+    return running;
+}
+
+// Wait until launchd reports the agent up again, up to `secs`. Returns 1 if so.
+static int perm_wait_for_agent(int secs)
+{
+    for (int i = 0; i < secs * 2; i++)
     {
-        close(fd);
-        printf("      (agent socket not reachable at %s -- is the agent running?)\n", path);
-        return;
+        if (perm_agent_running()) return 1;
+        usleep(500000);
     }
-    // Hold the session open long enough for kvm_init() + the first capture, which
-    // is what raises the dialog. Then close: the agent exits and launchd restarts
-    // it, so the next start already sees the grant.
+    return 0;
+}
+
+static void perm_fake_kvm_session(void)
+{
+    // The connection that succeeds IS the session -- never open a throwaway one.
+    int fd = perm_connect_agent();
+    if (fd < 0)
+    {
+        // Almost always mid-respawn rather than absent: the previous session
+        // made the agent exit, and its LaunchAgent throttles restarts by 30s.
+        perm_kickstart_agent();
+        for (int i = 0; i < 90 && fd < 0; i++) { usleep(500000); fd = perm_connect_agent(); }
+        if (fd < 0)
+        {
+            printf("      (the agent is not reachable -- grant these in System Settings instead)\n");
+            return;
+        }
+    }
+    // Hold it open long enough for kvm_init() + the first capture, which is what
+    // raises the dialog.
     sleep(6);
     close(fd);
 }
@@ -1544,23 +1618,69 @@ static int perm_log_last_int(const char *key, int deflt)
 }
 
 static void perm_fake_kvm_session(void);
+static void perm_kickstart_agent(void);
+static int  perm_wait_for_agent(int secs);
 
-// Make the agent re-report: a session drives kvm_init (logs preflight), and
-// dropping it makes the agent exit so launchd restarts it (logs AXIsProcessTrusted).
+// Make the agent re-report: a session drives kvm_init (logs preflight), and a
+// restart re-runs its startup probe (logs AXIsProcessTrusted, and prompts for
+// Accessibility if it is still missing).
+//
+// The restart must be forced. Letting launchd do it costs ThrottleInterval=30
+// seconds, and the previous fixed sleep(4) simply read a stale log while the
+// agent was still dead.
 static void perm_refresh_agent_status(void)
 {
     perm_fake_kvm_session();
-    sleep(4);   // let launchd restart it and log the startup line
+    perm_kickstart_agent();
+    perm_wait_for_agent(45);
+    sleep(2);   // let the startup lines land in the log
 }
 
 static int perm_has_accessibility(void) { return perm_log_last_int("AXIsProcessTrusted=", 0) != 0; }
 
 static int perm_has_screencapture(void) { return perm_log_last_int("preflight=", 0) != 0; }
 
-// Full Disk Access cannot be asked of the agent this way -- it never reports it --
-// and probing files HERE is misleading for the same responsible-process reason
-// (over ssh it reads as granted because sshd holds FDA). Treated as advisory only.
-static int perm_has_fda(void) { return _fullDiskAuthorizationStatus() == MPAuthorizationStatusAuthorized; }
+// Full Disk Access is deliberately NOT probed from this program.
+//
+// _fullDiskAuthorizationStatus() opens protected files, and TCC answers for the
+// RESPONSIBLE process. Run from the installer that is the operator's shell, so
+// the probe reports Terminal's access, never the agent's -- and, worse, the
+// attempt makes tccd create a row for it. Measured 2026-09-10 on the operator's
+// VM, after a walkthrough that had "failed" to verify FDA:
+//     kTCCServiceSystemPolicyAllFiles|com.apple.Terminal|0                 <- us
+//     kTCCServiceSystemPolicyAllFiles|/usr/local/.../meshagent/meshagent|2 <- real
+// The grant was there the whole time; only our check was wrong, and it looped
+// forever demanding something already done. Same reason the operator saw a
+// stray Terminal entry appear in the Privacy lists.
+//
+// It is also the wrong binary to ask about: file transfer runs in the root
+// daemon, not in this KVM helper, so the grant belongs on the daemon and this
+// process could not observe it even with correct attribution. Step 3 therefore
+// names the exact path to add and states plainly that it cannot verify it.
+
+// Path of the root daemon, which is the binary that needs Full Disk Access.
+// This program is <dir>/kvm/meshagent; the daemon is <dir>/meshagent.
+static void perm_daemon_path(char *out, size_t outsz)
+{
+    char exe[PATH_MAX];
+    uint32_t sz = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &sz) != 0) { snprintf(out, outsz, "the MeshAgent daemon"); return; }
+    char real[PATH_MAX];
+    if (realpath(exe, real) == NULL) snprintf(real, sizeof(real), "%s", exe);
+
+    char *base = strrchr(real, '/');
+    if (base == NULL) { snprintf(out, outsz, "%s", real); return; }
+    *base = 0;                          // real = .../kvm
+    char *parent = strrchr(real, '/');
+    if (parent == NULL || strcmp(parent + 1, "kvm") != 0)
+    {
+        *base = '/';
+        snprintf(out, outsz, "%s", real);
+        return;
+    }
+    *parent = 0;                        // real = the install dir
+    snprintf(out, outsz, "%s/%s", real, base + 1);
+}
 
 // Poll until granted or the user gives up. Returns 1 if granted.
 // `check` reads the agent's own report, so refresh it before believing a "no".
@@ -1600,15 +1720,17 @@ void kvm_request_permissions_interactive(int wantFDA)
     if (perm_has_accessibility()) { printf("      -> already granted\n"); }
     else
     {
-        if (__builtin_available(macOS 10.9, *))
-        {
-            const void *k[] = { kAXTrustedCheckOptionPrompt };
-            const void *v[] = { kCFBooleanTrue };
-            CFDictionaryRef o = CFDictionaryCreate(kCFAllocatorDefault, k, v, 1,
-                &kCFCopyStringDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            AXIsProcessTrustedWithOptions(o);
-            CFRelease(o);
-        }
+        // Ask the AGENT to raise it, exactly as step 2 does for Screen Recording.
+        //
+        // Calling AXIsProcessTrustedWithOptions() here used to work well enough
+        // that meshagent appeared in the pane, but it also made tccd record
+        // kTCCServiceAccessibility|com.apple.Terminal (measured 2026-09-10) and
+        // produced a SECOND dialog when the agent restarted and prompted for
+        // itself. One prompt, correctly attributed, is better than two.
+        printf("      restarting the agent so macOS raises its dialog...\n");
+        perm_kickstart_agent();
+        perm_wait_for_agent(45);
+        sleep(2);
         perm_wait("Accessibility", perm_has_accessibility, "Privacy_Accessibility");
     }
 
@@ -1638,22 +1760,30 @@ void kvm_request_permissions_interactive(int wantFDA)
         perm_wait("Screen Recording", perm_has_screencapture, "Privacy_ScreenCapture");
     }
 
-    // [3] Full Disk Access -- optional. There is no API to prompt for it, so the
-    // pane is the only route; we probe readability of protected files to detect it.
+    // [3] Full Disk Access -- optional, and the one step that cannot be verified
+    // from here (see perm_daemon_path above). Name the exact binary and move on
+    // rather than looping on a check that is guaranteed to answer about the
+    // operator's shell.
     printf("\n[3/3] Full Disk Access  (optional: file transfer to protected locations)\n");
     if (!wantFDA) { printf("      -> not requested\n"); }
-    else if (perm_has_fda()) { printf("      -> already granted\n"); }
     else
     {
-        char ans[32];
+        char ans[32], dpath[PATH_MAX];
+        perm_daemon_path(dpath, sizeof(dpath));
         printf("      Needed only to push/download files into protected folders\n");
         printf("      (Desktop, Documents, Downloads, Mail, etc.) on this Mac.\n");
         if (perm_ask("      Grant Full Disk Access now? [y/N]: ", ans, sizeof(ans))
             && (ans[0] == 'y' || ans[0] == 'Y'))
         {
             perm_open_pane("Privacy_AllFiles");
-            printf("      Add and enable this program in the list that opened.\n");
-            perm_wait("Full Disk Access", perm_has_fda, "Privacy_AllFiles");
+            printf("      In the list that just opened, click \"+\", press\n");
+            printf("      Shift-Command-G, and paste this exact path:\n\n");
+            printf("          %s\n\n", dpath);
+            printf("      then make sure its switch is ON.\n");
+            printf("      (This one cannot be checked from here -- the check would\n");
+            printf("       report this Terminal's access, not the agent's.)\n");
+            perm_ask("      Press Return when done : ", ans, sizeof(ans));
+            printf("      -> Full Disk Access: left to you to confirm in the pane\n");
         }
         else { printf("      -> skipped (can be granted later in System Settings)\n"); }
     }
@@ -1665,7 +1795,7 @@ void kvm_request_permissions_interactive(int wantFDA)
     printf("  Screen Recording: %s\n", perm_has_screencapture() ? "granted" : "NOT granted");
     // Not asserted either way: this process cannot see the agent's FDA state, and
     // probing from here reports the responsible process's access, not the agent's.
-    printf("  Full Disk Access: optional -- verify in System Settings if you use file transfer\n\n");
+    printf("  Full Disk Access: optional -- confirm in System Settings if you use file transfer\n\n");
 }
 
 void kvm_check_permission()
@@ -1743,6 +1873,21 @@ int kvmagent_ax_poll_start(void)
         // If it's already granted at launch, no restart needed.
         if (!AXIsProcessTrusted())
         {
+            // Raise Apple's dialog from HERE rather than from the installer's
+            // walkthrough. This process is spawned by launchd, so it is its own
+            // responsible process and the grant/record land on meshagent. The
+            // walkthrough calling this itself attributed to the operator's shell
+            // and left a stray com.apple.Terminal row behind (measured
+            // 2026-09-10), as well as prompting twice.
+            const void *keys[] = { kAXTrustedCheckOptionPrompt };
+            const void *values[] = { kCFBooleanTrue };
+            CFDictionaryRef options = CFDictionaryCreate(kCFAllocatorDefault,
+                keys, values, 1,
+                &kCFCopyStringDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            AXIsProcessTrustedWithOptions(options);
+            CFRelease(options);
+
             pthread_t t;
             pthread_create(&t, NULL, ax_poll_thread, NULL);
             pthread_detach(t);
