@@ -46,6 +46,11 @@ mkdir -p "$DEST"
 cp installer/meshinstall.sh        "$DEST/"
 cp installer/meshinstall.command   "$DEST/"
 cp installer/uninstall.sh          "$DEST/"
+# ...and the two scripts again at the web root, so what a user has to TYPE is
+# https://<host>/install.sh rather than https://<host>/meshsetup/meshinstall.sh.
+# Same files, shorter path; the long ones keep working.
+cp installer/meshinstall.sh        "$MC/public/install.sh"
+cp installer/uninstall.sh          "$MC/public/uninstall.sh"
 # the double-click launcher, zipped so the +x bit survives download:
 ( cd installer && zip -X "$DEST/meshinstall.command.zip" meshinstall.command )
 # the thin binaries the installer downloads by architecture:
@@ -54,9 +59,19 @@ cp prebuilt/meshagent_osx-x86-64   "$DEST/"
 chmod 644 "$DEST"/*
 ```
 
-Resulting public URLs (`https://<host>/meshsetup/…`): `meshinstall.sh`,
-`meshinstall.command`, `meshinstall.command.zip`, `uninstall.sh`, `meshagent_osx-arm-64`,
-`meshagent_osx-x86-64`.
+Resulting public URLs:
+
+| URL | what it is |
+|---|---|
+| `https://<host>/install.sh` | what users type — `curl -fsSL https://<host>/install.sh \| sudo bash` |
+| `https://<host>/uninstall.sh` | same, for removal |
+| `https://<host>/meshsetup/meshinstall.command.zip` | double-click launcher (zipped so the +x bit survives) |
+| `https://<host>/meshsetup/meshagent_osx-arm-64`, `-x86-64` | the binaries the installer fetches by arch |
+| `https://<host>/meshsetup/meshinstall.sh`, `uninstall.sh`, `meshinstall.command` | the longer paths, kept working |
+
+> Keep `-f` in the curl line. Without it curl prints the server's **error page** on a 404 or a
+> proxy failure and exits 0, and that HTML gets piped straight into `bash`. `-sS` only hides
+> the progress meter, and `-L` follows redirects; `-f` is the one that matters.
 
 > ⚠️ **Do NOT use `domain.share` in `config.json`** to serve these. It mounts a static
 > directory at the site root and **shadows MeshCentral's own routing**, taking the web UI

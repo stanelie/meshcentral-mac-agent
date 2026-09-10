@@ -17,7 +17,7 @@ read _
 echo
 echo "STEP 2 of 3 — Installing the agent (you will be asked for your password)..."
 echo
-if ! curl -fsSL https://__HOST__/meshsetup/meshinstall.sh | sudo bash; then
+if ! curl -fsSL https://__HOST__/install.sh | sudo bash; then
     echo
     echo "  !! Install failed — check the network and run this again."
     printf "  Press Return to close... "; read _

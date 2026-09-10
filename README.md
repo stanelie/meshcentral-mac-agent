@@ -40,7 +40,7 @@ modern macOS refuses to install**.
    [Architecture](docs/architecture.md).)
 2. Run the installer:
    ```bash
-   curl -fsSL https://<your-host>/meshsetup/meshinstall.sh | sudo bash
+   curl -fsSL https://<your-host>/install.sh | sudo bash
    ```
    …or download and double-click `meshinstall.command`, which walks through all three steps.
 3. **System Settings → Privacy & Security → Screen Recording → enable `meshagent`**
@@ -52,7 +52,7 @@ its real group from there.
 
 To remove everything cleanly:
 ```bash
-curl -fsSL https://<your-host>/meshsetup/uninstall.sh | sudo bash
+curl -fsSL https://<your-host>/uninstall.sh | sudo bash
 ```
 
 ---
@@ -157,11 +157,12 @@ commands):
    (`meshagent_osx-arm-64`, `-x86-64`, `-universal-64`). MeshCentral withholds the agent
    *core* (no Desktop tab) until the connecting agent's hash matches the served binary.
 2. **Your configured installer + the binaries** hosted under
-   `node_modules/meshcentral/public/meshsetup/` (served unauthenticated at
-   `https://<your-host>/meshsetup/…`).
+   `node_modules/meshcentral/public/` (served unauthenticated at the web root). The two
+   scripts sit at the top so the typed URL stays short — `install.sh` and `uninstall.sh` —
+   with the binaries and the double-click launcher under `meshsetup/`.
 
-Then your install command is `curl -fsSL https://<your-host>/meshsetup/meshinstall.sh | sudo
-bash`, and the double-click `meshinstall.command.zip` is downloadable from the same folder.
+Then your install command is `curl -fsSL https://<your-host>/install.sh | sudo bash`, and the
+double-click `meshinstall.command.zip` is downloadable from `/meshsetup/`.
 
 ## Building the agent binaries
 
