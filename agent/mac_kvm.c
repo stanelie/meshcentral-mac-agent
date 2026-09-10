@@ -1509,13 +1509,14 @@ static int perm_connect_agent(void)
 
 // Bring the agent back NOW.
 //
-// Closing a session makes the agent exit, and its LaunchAgent sets
-// ThrottleInterval=30 -- so launchd waits half a minute before respawning.
-// Measured 2026-09-10: after a session closed, the socket was still dead 40s
-// later, which is what produced both "agent socket not reachable" and the
-// "still not granted" loop (the walkthrough was reading a stale log while the
-// agent was simply down). `launchctl kickstart -k` bypasses the throttle;
-// measured 13s to a fresh, listening agent.
+// Closing a session makes the agent exit, so how fast it comes back is
+// launchd's ThrottleInterval. That used to be 30 in the installed LaunchAgent:
+// measured 2026-09-10, the socket was still dead 40s after a session closed,
+// which produced both "agent socket not reachable" and the "still not granted"
+// loop (the walkthrough was reading a stale log while the agent was down).
+// The installer now writes 5, but do not rely on it -- this program also runs
+// against agents installed before that change. `launchctl kickstart -k`
+// bypasses the throttle whatever it is; measured 13s to a listening agent.
 static void perm_kickstart_agent(void)
 {
     char cmd[160];
@@ -1625,9 +1626,9 @@ static int  perm_wait_for_agent(int secs);
 // restart re-runs its startup probe (logs AXIsProcessTrusted, and prompts for
 // Accessibility if it is still missing).
 //
-// The restart must be forced. Letting launchd do it costs ThrottleInterval=30
-// seconds, and the previous fixed sleep(4) simply read a stale log while the
-// agent was still dead.
+// The restart must be forced. Waiting for launchd costs ThrottleInterval --
+// up to 30s on agents installed before that was lowered to 5 -- and the
+// previous fixed sleep(4) simply read a stale log while the agent was dead.
 static void perm_refresh_agent_status(void)
 {
     perm_fake_kvm_session();

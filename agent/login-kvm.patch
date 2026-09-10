@@ -1738,7 +1738,7 @@ index d6bb534..adf87a7 100644
  
  #endif /* LINUX_EVENTS_H_ */
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..213f307 100644
+index 6d57690..2113f3f 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -2218,7 +2218,7 @@ index 6d57690..213f307 100644
  	}
  }
  
-@@ -1150,6 +1403,401 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,6 +1403,402 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -2328,13 +2328,14 @@ index 6d57690..213f307 100644
 +
 +// Bring the agent back NOW.
 +//
-+// Closing a session makes the agent exit, and its LaunchAgent sets
-+// ThrottleInterval=30 -- so launchd waits half a minute before respawning.
-+// Measured 2026-09-10: after a session closed, the socket was still dead 40s
-+// later, which is what produced both "agent socket not reachable" and the
-+// "still not granted" loop (the walkthrough was reading a stale log while the
-+// agent was simply down). `launchctl kickstart -k` bypasses the throttle;
-+// measured 13s to a fresh, listening agent.
++// Closing a session makes the agent exit, so how fast it comes back is
++// launchd's ThrottleInterval. That used to be 30 in the installed LaunchAgent:
++// measured 2026-09-10, the socket was still dead 40s after a session closed,
++// which produced both "agent socket not reachable" and the "still not granted"
++// loop (the walkthrough was reading a stale log while the agent was down).
++// The installer now writes 5, but do not rely on it -- this program also runs
++// against agents installed before that change. `launchctl kickstart -k`
++// bypasses the throttle whatever it is; measured 13s to a listening agent.
 +static void perm_kickstart_agent(void)
 +{
 +    char cmd[160];
@@ -2444,9 +2445,9 @@ index 6d57690..213f307 100644
 +// restart re-runs its startup probe (logs AXIsProcessTrusted, and prompts for
 +// Accessibility if it is still missing).
 +//
-+// The restart must be forced. Letting launchd do it costs ThrottleInterval=30
-+// seconds, and the previous fixed sleep(4) simply read a stale log while the
-+// agent was still dead.
++// The restart must be forced. Waiting for launchd costs ThrottleInterval --
++// up to 30s on agents installed before that was lowered to 5 -- and the
++// previous fixed sleep(4) simply read a stale log while the agent was dead.
 +static void perm_refresh_agent_status(void)
 +{
 +    perm_fake_kvm_session();
@@ -2620,7 +2621,7 @@ index 6d57690..213f307 100644
  void kvm_check_permission()
  {
  
-@@ -1190,4 +1838,60 @@ void kvm_check_permission()
+@@ -1190,4 +1839,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

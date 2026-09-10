@@ -94,7 +94,15 @@ cat > "/Library/LaunchAgents/$SV.plist" <<PL
 <key>WorkingDirectory</key><string>$D/kvmstate/</string>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-<key>ThrottleInterval</key><integer>30</integer>
+<!-- The kvmagent exits every time a KVM session closes, so this is a NORMAL
+     restart interval, not a crash backoff. At the launchd default (10) -- and
+     far worse at the 30 this used to carry -- the agent is simply absent for
+     that long after each session: reopening the Desktop tab inside the window
+     silently gets nothing, and the installer's permission walkthrough had to
+     force restarts with `launchctl kickstart -k` to make any progress
+     (measured 2026-09-10: socket still dead 40s after a session closed).
+     5 covers the exit-and-relaunch without allowing a hot crash loop. -->
+<key>ThrottleInterval</key><integer>5</integer>
 </dict></plist>
 PL
 chown root:wheel "/Library/LaunchAgents/$SV.plist"; chmod 644 "/Library/LaunchAgents/$SV.plist"
