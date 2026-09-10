@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..aa3b75e 100644
+index b70a508..a8a57c2 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -74,7 +74,7 @@ index b70a508..aa3b75e 100644
  	else if (argc > 1 && strcasecmp(argv[1], "-kvmagent") == 0)
  	{
  		// User-context LaunchAgent mode: long-running KVM server that
-@@ -327,8 +364,88 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -327,8 +364,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
  			kvm_set_listener_path(defaultPath);
  		}
@@ -128,14 +128,21 @@ index b70a508..aa3b75e 100644
 +				CFRelease(_opts);
 +			}
 +		}
-+		// NOTE: deliberately no CGRequestScreenCaptureAccess() here.
-+		// It does not register this program with tccd ("Service
-+		// kTCCServiceScreenCapture does not allow prompting; returning denied"),
-+		// so opening the Screen Recording pane afterwards showed an EMPTY list,
-+		// and it re-triggers a recurring permission banner even when the grant
-+		// already exists (see the note in kvm_init). Screen Recording is asked
-+		// for by the installer instead, via `-requestperms`, which attempts a
-+		// real capture so macOS raises its own dialog.
++		// No Screen Recording request here, on purpose.
++		//
++		// Neither CGRequestScreenCaptureAccess() nor a capture probe works from this
++		// process: TCC credits a ScreenCapture request to the RESPONSIBLE process, and
++		// this LaunchAgent inherits that from whoever bootstrapped it -- the installer,
++		// i.e. the operator's shell. Measured on clean Tahoe 26.6.2: tccd recorded
++		// kTCCServiceScreenCapture|com.apple.Terminal and never a meshagent row, so the
++		// Screen Recording pane had nothing to toggle. Clearing Terminal's row and
++		// restarting recreated it; a reboot did not clear it either. And
++		// CGRequestScreenCaptureAccess() additionally re-triggers a recurring banner
++		// even once granted (see kvm_init).
++		//
++		// The installer asks for it instead, via `-requestperms`, by opening a brief
++		// local KVM session against this agent -- the one path observed to raise the
++		// dialog correctly populated with meshagent.
 +		// Poll for Accessibility permission in a background thread. When
 +		// the user grants it after the prompt, exit with a non-zero code so
 +		// launchd restarts the process — the fresh process will start with
@@ -1731,7 +1738,7 @@ index d6bb534..adf87a7 100644
  
  #endif /* LINUX_EVENTS_H_ */
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..e2270be 100644
+index 6d57690..6a08f75 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -2210,7 +2217,7 @@ index 6d57690..e2270be 100644
  	}
  }
  
-@@ -1150,6 +1402,148 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,6 +1402,272 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -2246,11 +2253,24 @@ index 6d57690..e2270be 100644
 +    CFRelease(u);
 +}
 +
-+// Read a line from the controlling terminal. stdin is unusable here: the
-+// installer is normally run as `curl ... | sudo bash`, so stdin is the script.
-+// Returns 0 when there is no tty (non-interactive install) so callers can skip.
++// Read a line from the operator.
++//
++// Prefer stdin: the installer runs this under `launchctl asuser`, which detaches
++// the process from its controlling terminal, so fopen("/dev/tty") is unreliable
++// there (it returned NULL mid-run and made the walkthrough "skip" a step it
++// should have waited on). The installer redirects stdin from /dev/tty for us, so
++// an inherited fd still works even with no controlling terminal. Fall back to
++// /dev/tty only when stdin is not a terminal.
++// Returns 0 when neither is usable, so callers can skip instead of hanging an
++// unattended install.
 +static int perm_ask(const char *prompt, char *out, size_t outsz)
 +{
++    if (isatty(STDIN_FILENO))
++    {
++        printf("%s", prompt); fflush(stdout);
++        if (fgets(out, (int)outsz, stdin) != NULL) return 1;
++        return 0;
++    }
 +    FILE *tty = fopen("/dev/tty", "r+");
 +    if (!tty) return 0;
 +    fputs(prompt, tty); fflush(tty);
@@ -2259,17 +2279,110 @@ index 6d57690..e2270be 100644
 +    return 1;
 +}
 +
-+static int perm_has_accessibility(void) { return AXIsProcessTrusted() ? 1 : 0; }
-+
-+static int perm_has_screencapture(void)
++// Drive a brief, local KVM session so macOS raises the Screen Recording dialog
++// against the AGENT.
++//
++// Everything else was tried and measured to fail (2026-09-09, clean Tahoe 26.6.2):
++//   - CGRequestScreenCaptureAccess() creates no tccd record at all, and
++//     re-triggers a recurring banner even once granted (see kvm_init).
++//   - Capturing from this walkthrough attributes to the RESPONSIBLE process,
++//     which is the operator's shell -- tccd recorded
++//     kTCCServiceScreenCapture|com.apple.Terminal and no meshagent row, so the
++//     pane listed nothing to toggle.
++//   - Probing at agent startup did not help either: the LaunchAgent had been
++//     bootstrapped by the installer, so the job inherited that same responsible
++//     process. Clearing Terminal's row and restarting merely recreated it.
++//     A reboot did not clear it.
++// What DOES work, observed by the operator and then confirmed here, is a real
++// Desktop session: the prompt appears correctly populated with meshagent.
++//
++// A Desktop session is just the daemon connecting to the agent's unix socket --
++// on accept the agent runs kvm_init() and its capture loop. So connect to that
++// socket ourselves, hold it briefly, and drop it. Who connects is irrelevant to
++// TCC: the capture is performed by the agent process, which is what tccd judges.
++static void perm_fake_kvm_session(void)
 +{
-+    if (__builtin_available(macOS 10.15, *)) return CGPreflightScreenCaptureAccess() ? 1 : 0;
-+    return 1;
++    char path[128];
++    snprintf(path, sizeof(path), "/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
++
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0) { printf("      (could not open a socket)\n"); return; }
++    struct sockaddr_un a;
++    memset(&a, 0, sizeof(a));
++    a.sun_family = AF_UNIX;
++    strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
++    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0)
++    {
++        close(fd);
++        printf("      (agent socket not reachable at %s -- is the agent running?)\n", path);
++        return;
++    }
++    // Hold the session open long enough for kvm_init() + the first capture, which
++    // is what raises the dialog. Then close: the agent exits and launchd restarts
++    // it, so the next start already sees the grant.
++    sleep(6);
++    close(fd);
 +}
 +
++// IMPORTANT: this walkthrough must NOT test the permissions itself.
++//
++// TCC answers a status query for the RESPONSIBLE process, and this program runs
++// as a child of the installer, i.e. of the operator's shell. Measured on clean
++// Tahoe 26.6.2 with both grants present in TCC.db (auth_value=2):
++//     agent (launchd-spawned) : preflight=1            <- correct
++//     this process (shell child): "NOT granted"        <- wrong
++// Checking locally therefore loops forever telling the operator to grant
++// something that is already granted -- which is what happened.
++//
++// So ask the AGENT. It already records both values every time it starts and
++// every time a session initialises:
++//     "AXIsProcessTrusted=%d at startup"
++//     "kvm_init: ... preflight=%d"
++// perm_fake_kvm_session() makes it re-run both, then we read the freshest line.
++
++#define PERM_AGENT_LOG "/tmp/kvm_debug.log"
++
++// Last integer following `key` in the agent's log, or `deflt` if never seen.
++static int perm_log_last_int(const char *key, int deflt)
++{
++    FILE *f = fopen(PERM_AGENT_LOG, "r");
++    if (!f) return deflt;
++    char line[1024];
++    int val = deflt;
++    while (fgets(line, sizeof(line), f) != NULL)
++    {
++        char *p = strstr(line, key);
++        if (p != NULL)
++        {
++            int v;
++            if (sscanf(p + strlen(key), "%d", &v) == 1) val = v;
++        }
++    }
++    fclose(f);
++    return val;
++}
++
++static void perm_fake_kvm_session(void);
++
++// Make the agent re-report: a session drives kvm_init (logs preflight), and
++// dropping it makes the agent exit so launchd restarts it (logs AXIsProcessTrusted).
++static void perm_refresh_agent_status(void)
++{
++    perm_fake_kvm_session();
++    sleep(4);   // let launchd restart it and log the startup line
++}
++
++static int perm_has_accessibility(void) { return perm_log_last_int("AXIsProcessTrusted=", 0) != 0; }
++
++static int perm_has_screencapture(void) { return perm_log_last_int("preflight=", 0) != 0; }
++
++// Full Disk Access cannot be asked of the agent this way -- it never reports it --
++// and probing files HERE is misleading for the same responsible-process reason
++// (over ssh it reads as granted because sshd holds FDA). Treated as advisory only.
 +static int perm_has_fda(void) { return _fullDiskAuthorizationStatus() == MPAuthorizationStatusAuthorized; }
 +
 +// Poll until granted or the user gives up. Returns 1 if granted.
++// `check` reads the agent's own report, so refresh it before believing a "no".
 +static int perm_wait(const char *label, int (*check)(void), const char *pane)
 +{
 +    char buf[32];
@@ -2284,6 +2397,8 @@ index 6d57690..e2270be 100644
 +        }
 +        if (buf[0] == 's' || buf[0] == 'S') { printf("      -> %s SKIPPED\n", label); return 0; }
 +        if (buf[0] == 'o' || buf[0] == 'O') { perm_open_pane(pane); continue; }
++        printf("      checking with the agent...\n");
++        perm_refresh_agent_status();
 +        if (check()) { printf("      -> %s granted\n", label); return 1; }
 +        printf("      still not granted.\n");
 +    }
@@ -2316,17 +2431,29 @@ index 6d57690..e2270be 100644
 +        perm_wait("Accessibility", perm_has_accessibility, "Privacy_Accessibility");
 +    }
 +
-+    // [2] Screen Recording -- the remote screen. Attempt a REAL capture so tccd
-+    // registers this program and macOS raises its own dialog; without this the
-+    // Screen Recording pane lists nothing to toggle.
++    // [2] Screen Recording -- the remote screen.
++    //
++    // This step must NOT attempt the capture itself. TCC attributes a
++    // ScreenCapture request to the process RESPONSIBLE for the requester, not to
++    // the requester. The installer runs this walkthrough as a child of the
++    // operator's shell, so measured attribution was
++    // responsible={com.apple.Terminal} (and sshd-keygen-wrapper when driven over
++    // ssh) -- the grant would land on Terminal, meshagent would never get a TCC
++    // record of its own, and the Screen Recording pane would list nothing to
++    // toggle. Which is exactly what happened.
++    //
++    // A launchd-spawned process is its own responsible process, so the capture
++    // has to come from the -kvmagent LaunchAgent. Kick it so it re-runs its
++    // startup probe; that raises Apple's dialog attributed to meshagent and
++    // creates the record that puts it in the pane. Then just pace the operator.
++    // (Accessibility above does not need this: AXIsProcessTrustedWithOptions
++    // attributes to the calling process, which is why its grant landed correctly.)
 +    printf("\n[2/3] Screen Recording  (required: the remote screen)\n");
 +    if (perm_has_screencapture()) { printf("      -> already granted\n"); }
 +    else
 +    {
-+        printf("      requesting a screen capture so macOS shows its dialog...\n");
-+        extern CGImageRef kvm_capture_sck(uint32_t displayID);
-+        CGImageRef probe = kvm_capture_sck((uint32_t)CGMainDisplayID());
-+        if (probe) CGImageRelease(probe);
++        printf("      opening a short local KVM session so macOS raises its dialog...\n");
++        perm_fake_kvm_session();
 +        perm_wait("Screen Recording", perm_has_screencapture, "Privacy_ScreenCapture");
 +    }
 +
@@ -2350,16 +2477,20 @@ index 6d57690..e2270be 100644
 +        else { printf("      -> skipped (can be granted later in System Settings)\n"); }
 +    }
 +
++    printf("\n  confirming with the agent...\n");
++    perm_refresh_agent_status();
 +    printf("\n=== permissions step complete ===\n");
 +    printf("  Accessibility   : %s\n", perm_has_accessibility() ? "granted" : "NOT granted");
 +    printf("  Screen Recording: %s\n", perm_has_screencapture() ? "granted" : "NOT granted");
-+    printf("  Full Disk Access: %s\n\n", perm_has_fda() ? "granted" : "not granted (optional)");
++    // Not asserted either way: this process cannot see the agent's FDA state, and
++    // probing from here reports the responsible process's access, not the agent's.
++    printf("  Full Disk Access: optional -- verify in System Settings if you use file transfer\n\n");
 +}
 +
  void kvm_check_permission()
  {
  
-@@ -1190,4 +1584,45 @@ void kvm_check_permission()
+@@ -1190,4 +1708,45 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }
