@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..a8a57c2 100644
+index b70a508..b6d96b5 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -42,7 +42,7 @@ index b70a508..a8a57c2 100644
  #ifdef WIN32
  	int argvi, argvsz;
  	char **argv = (char**)ILibMemory_SmartAllocate(argc * sizeof(void*));
-@@ -303,6 +315,31 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -303,6 +315,46 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  		kvm_server_mainloop((void*)(uint64_t)getpid());
  		return 0;
  	}
@@ -53,6 +53,21 @@ index b70a508..a8a57c2 100644
 +	//   -requestperms nofda  skip the Full Disk Access step entirely
 +	// Must run as the console user: TCC attributes the grant to the process's
 +	// path, and the grants have to land on this binary in the user's session.
++	// -vncprobe: open one brief local RFB session against screensharingd, so
++	// macOS raises ScreensharingAgent's "direct access to the screen and audio"
++	// consent DURING the install rather than on the first pre-login connect.
++	// Root only: it reads kvm/vnc.pw, which is root:wheel 0600.
++	else if (argc > 1 && strcasecmp(argv[1], "-vncprobe") == 0)
++	{
++		extern void vnc_probe_once(void);
++		if (getuid() != 0)
++		{
++			printf("-vncprobe must run as root (it reads kvm/vnc.pw).\n");
++			return 1;
++		}
++		vnc_probe_once();
++		return 0;
++	}
 +	else if (argc > 1 && strcasecmp(argv[1], "-requestperms") == 0)
 +	{
 +		extern void kvm_request_permissions_interactive(int wantFDA);
@@ -74,7 +89,7 @@ index b70a508..a8a57c2 100644
  	else if (argc > 1 && strcasecmp(argv[1], "-kvmagent") == 0)
  	{
  		// User-context LaunchAgent mode: long-running KVM server that
-@@ -327,8 +364,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -327,8 +379,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
  			kvm_set_listener_path(defaultPath);
  		}
@@ -172,10 +187,10 @@ index b70a508..a8a57c2 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..d818cb1 100644
+index c27e1f0..cd8386c 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,1081 @@
+@@ -2,13 +2,1109 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -951,6 +966,34 @@ index c27e1f0..d818cb1 100644
 +    return 1;
 +}
 +
++// Install-time consent trigger for Apple's ScreensharingAgent.
++//
++// A pre-login session drives input through screensharingd, and the first time
++// that happens macOS asks the operator to let ScreensharingAgent "bypass the
++// system private window picker and directly access the screen and audio".
++// Measured 2026-09-10: that prompt fires once per machine -- it appeared on the
++// first pre-login connect and did NOT return after a reboot and a second one.
++// So it can be moved into the install, where the operator is already answering
++// dialogs, instead of ambushing them on the first real support call.
++//
++// Note this needs no responsible-process care, unlike the meshagent grants:
++// the process being judged is Apple's ScreensharingAgent, which screensharingd
++// spawns from launchd, so it is its own responsible process no matter who
++// opened the connection. Merely completing the RFB handshake is enough; we
++// never ask for a framebuffer update.
++//
++// Must run as root -- vnc.pw is root:wheel 0600 by design.
++void vnc_probe_once(void)
++{
++    if (!vnc_connect())
++    {
++        printf("      (could not reach Screen Sharing on 127.0.0.1:5900)\n");
++        return;
++    }
++    sleep(3);
++    vnc_disconnect();
++}
++
 +// ADB keycode → X11 keysym for RFB KeyEvent messages.
 +static uint32_t adb_to_x11keysym(CGKeyCode adb)
 +{
@@ -1260,7 +1303,7 @@ index c27e1f0..d818cb1 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1200,324 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1228,324 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
@@ -1382,7 +1425,7 @@ index c27e1f0..d818cb1 100644
 +        vnc_inject_mouse(absX, absY, button, wheel);
 +        return;
 +    }
-+
+ 
 +    // In-session path: virtual HID device if we have one, else CGEvent.
 +    if (g_mouse_dev) {
 +        MouseReport r = {0};
@@ -1399,7 +1442,7 @@ index c27e1f0..d818cb1 100644
 +            (uint8_t*)&r, sizeof(r));
 +        return;
 +    }
- 
++
 +	dispatch_once_f(&g_postOnce, NULL, post_init_once);
 +	CGEventRef e = NULL;
 +	if (wheel != 0) {
@@ -1727,16 +1770,17 @@ index c27e1f0..d818cb1 100644
 +    CFRelease(e);
  }
 diff --git a/meshcore/KVM/MacOS/mac_events.h b/meshcore/KVM/MacOS/mac_events.h
-index d6bb534..adf87a7 100644
+index d6bb534..94eb8b0 100644
 --- a/meshcore/KVM/MacOS/mac_events.h
 +++ b/meshcore/KVM/MacOS/mac_events.h
-@@ -378,5 +378,6 @@ struct keymap_t {
+@@ -378,5 +378,7 @@ struct keymap_t {
  extern void MouseAction(double absX, double absY, int button, short wheel);
  extern void KeyAction(unsigned char vk, int up);
  extern void KeyActionUnicode(uint16_t unicode, int up);
 +extern void hid_inject_init(void);
  
  #endif /* LINUX_EVENTS_H_ */
++void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
 index 6d57690..2113f3f 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c

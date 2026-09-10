@@ -773,6 +773,34 @@ static int vnc_connect(void)
     return 1;
 }
 
+// Install-time consent trigger for Apple's ScreensharingAgent.
+//
+// A pre-login session drives input through screensharingd, and the first time
+// that happens macOS asks the operator to let ScreensharingAgent "bypass the
+// system private window picker and directly access the screen and audio".
+// Measured 2026-09-10: that prompt fires once per machine -- it appeared on the
+// first pre-login connect and did NOT return after a reboot and a second one.
+// So it can be moved into the install, where the operator is already answering
+// dialogs, instead of ambushing them on the first real support call.
+//
+// Note this needs no responsible-process care, unlike the meshagent grants:
+// the process being judged is Apple's ScreensharingAgent, which screensharingd
+// spawns from launchd, so it is its own responsible process no matter who
+// opened the connection. Merely completing the RFB handshake is enough; we
+// never ask for a framebuffer update.
+//
+// Must run as root -- vnc.pw is root:wheel 0600 by design.
+void vnc_probe_once(void)
+{
+    if (!vnc_connect())
+    {
+        printf("      (could not reach Screen Sharing on 127.0.0.1:5900)\n");
+        return;
+    }
+    sleep(3);
+    vnc_disconnect();
+}
+
 // ADB keycode → X11 keysym for RFB KeyEvent messages.
 static uint32_t adb_to_x11keysym(CGKeyCode adb)
 {

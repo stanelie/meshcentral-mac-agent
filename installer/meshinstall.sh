@@ -290,6 +290,36 @@ echo "MeshAgent installed for group '$MESH_NAME' ($(uname -m))."
 # MESH_NO_FDA=1 skips only the optional Full Disk Access step.
 if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ "$CUSER" != "root" ]; then
     if [ -e /dev/tty ]; then
+        # Apple's OWN Screen Sharing helper needs consent too, separately from
+        # anything meshagent asks for. Login-window input is driven through
+        # screensharingd, and the first time that happens macOS asks the operator
+        # to let ScreensharingAgent "bypass the system private window picker and
+        # directly access the screen and audio". Measured 2026-09-10: it fires
+        # once per machine (it did not return after a reboot and a second
+        # pre-login connect), so asking here means it is answered during the
+        # install instead of ambushing whoever makes the first support call.
+        #
+        # This runs as ROOT on purpose -- it reads kvm/vnc.pw (root:wheel 0600).
+        # Unlike the meshagent grants it needs no responsible-process care: the
+        # process macOS judges is Apple's ScreensharingAgent, spawned by
+        # screensharingd from launchd, so it is its own responsible process no
+        # matter who opens the connection.
+        if /usr/sbin/netstat -an 2>/dev/null | grep -q '\.5900 .*LISTEN'; then
+            {
+                echo
+                echo "=== MeshAgent: Screen Sharing consent (Apple's own helper) ==="
+                echo "  Opening a brief local Screen Sharing session, so macOS asks for this"
+                echo "  now rather than on your first login-window connection."
+                echo "  Your screen may flicker for a couple of seconds."
+            } >/dev/tty
+            "$D/kvm/$EXE" -vncprobe >/dev/tty 2>&1
+            {
+                echo "  If macOS asked to allow direct access to the screen and audio, allow it."
+                printf "  Press Return to continue : "
+            } >/dev/tty
+            read -r _ </dev/tty || true
+        fi
+
         FDAARG=""
         [ "${MESH_NO_FDA:-0}" = "1" ] && FDAARG="nofda"
         /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" \
