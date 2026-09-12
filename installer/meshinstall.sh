@@ -38,6 +38,9 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
 esac
 echo "Downloading agent for $(uname -m) ..."
+# Clear the immutable flag first (see the kvm/ copy below for why anyone would
+# have set it) -- otherwise curl fails with EPERM even as root.
+chflags nouchg "$D/$EXE" 2>/dev/null || true
 if ! curl -fsSL "$BIN_URL" -o "$D/$EXE"; then echo "ERROR: could not download $BIN_URL"; exit 1; fi
 chmod 755 "$D/$EXE"; chown root:wheel "$D/$EXE"
 
@@ -67,7 +70,42 @@ chown root:wheel "/Library/LaunchDaemons/$SV.plist"; chmod 644 "/Library/LaunchD
 
 # ---- kvm/ subdir: kvmagent runs here (own db + socket) ----
 mkdir -p "$D/kvm"
-cp "$D/$EXE" "$D/kvm/$EXE"
+# Replace the kvmagent binary via a temp file and an atomic rename, and VERIFY it.
+#
+# A plain `cp` over this path has two ways to fail, and the installer used to
+# swallow both and report success anyway -- leaving the machine running the OLD
+# agent while every post-install check passed. Observed 2026-09-12 on a Mac that
+# did exactly that: the kvmagent was several builds behind and nothing said so.
+#
+#   1. chflags uchg. Someone may have pinned a binary here to stop MeshCentral's
+#      own agent auto-update from replacing it. cp then returns EPERM even as
+#      root, which is not obviously a permissions problem when you are already
+#      root and the directory is writable.
+#   2. The file is currently being executed. Writing into a running, signed
+#      Mach-O is refused; renaming over it is not, because the running process
+#      keeps its own inode and only the directory entry changes.
+chflags nouchg "$D/kvm/$EXE" 2>/dev/null || true
+if ! cp "$D/$EXE" "$D/kvm/$EXE.new"; then
+    echo "ERROR: could not stage $D/kvm/$EXE.new -- aborting rather than leaving a stale agent."
+    exit 1
+fi
+chmod 755 "$D/kvm/$EXE.new"; chown root:wheel "$D/kvm/$EXE.new"
+# Checksum the staged file BEFORE the rename, and compare the landed file to
+# that -- not to "$D/$EXE". The agent auto-updates itself, so "$D/$EXE" can be
+# rewritten by the running daemon while this script is mid-flight; comparing
+# against it produced a false "does not match" abort on a perfectly good install
+# (measured 2026-09-12). What actually needs verifying is that the rename took
+# effect, and this checks exactly that and nothing else.
+KVMSUM="$(/usr/bin/shasum -a 256 "$D/kvm/$EXE.new" 2>/dev/null | awk '{print $1}')"
+if ! mv -f "$D/kvm/$EXE.new" "$D/kvm/$EXE"; then
+    rm -f "$D/kvm/$EXE.new"
+    echo "ERROR: could not replace $D/kvm/$EXE -- aborting rather than leaving a stale agent."
+    exit 1
+fi
+if [ -z "$KVMSUM" ] || [ "$KVMSUM" != "$(/usr/bin/shasum -a 256 "$D/kvm/$EXE" 2>/dev/null | awk '{print $1}')" ]; then
+    echo "ERROR: $D/kvm/$EXE is not the binary we just staged -- aborting."
+    exit 1
+fi
 cp "$D/$EXE.msh" "$D/kvm/$EXE.msh"
 chmod 755 "$D/kvm/$EXE"; chown root:wheel "$D/kvm/$EXE"
 chown root:wheel "$D/kvm/$EXE.msh"; chmod 644 "$D/kvm/$EXE.msh"
@@ -99,7 +137,13 @@ cat > "/Library/LaunchAgents/$SV.plist" <<PL
      far worse at the 30 this used to carry -- the agent is simply absent for
      that long after each session: reopening the Desktop tab inside the window
      silently gets nothing, and the installer's permission walkthrough had to
-     force restarts with `launchctl kickstart -k` to make any progress
+     force restarts with "launchctl kickstart -k" to make any progress
+     (NOTE: keep backticks and dollar-paren out of this heredoc's TEXT. It is
+     unquoted so that $D and $SV expand, so both forms get EXECUTED here, not
+     printed. Both mistakes were made in turn: a backticked command in this very
+     comment ran launchctl kickstart -k on every install and pasted its empty
+     output into the plist, and the note warning about it then ran the ellipsis
+     inside its own dollar-paren example.)
      (measured 2026-09-10: socket still dead 40s after a session closed).
      5 covers the exit-and-relaunch without allowing a hot crash loop. -->
 <key>ThrottleInterval</key><integer>5</integer>
