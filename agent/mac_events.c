@@ -106,11 +106,29 @@ static void kvm_apply_mod_flags(CGEventRef e)
     CGEventSetFlags(e, CGEventGetFlags(e) | g_modFlags);
 }
 
+// Release any modifier the OS still believes is held down. Defined further
+// down, next to the CGEvent posting machinery it needs.
+static void kvm_release_os_modifiers(void);
+
 // Drop all injected modifier state. Called when a viewer (re)attaches so a
 // modifier held at disconnect can't stay latched into the next session.
+//
+// Zeroing g_modFlags alone was NOT enough, and the reason is worth stating: it
+// is our own bookkeeping, and it never tells the OS anything. A modifier whose
+// key-DOWN reached the system and whose key-UP did not stays latched in the
+// system's state, where nothing process-local can see or clear it.
+//
+// That is precisely what was reported 2026-09-12 (remote keyboard map OFF): the
+// letter 'e' stopped producing anything, indefinitely, and RECONNECTING DID NOT
+// FIX IT. The kvmagent exits and restarts per session, so every process-local
+// explanation predicts a reconnect clears it. It did not, which places the
+// latch in the OS. Option+E on the US layout is the acute-accent DEAD key, so a
+// latched Option turns 'e' into "begin an accent sequence" -- no visible
+// character -- which is why a single letter appeared to be singled out.
 void kvm_reset_modifiers(void)
 {
     g_modFlags = 0;
+    kvm_release_os_modifiers();
 }
 
 // Depth of the in-flight event queue. Mouse moves and (especially) pixel-unit
@@ -527,6 +545,8 @@ static void hidd_key(CGKeyCode adb, int down)
 }
 
 // ---- CGEvent fallback init -------------------------------------------------
+static void release_stuck_modifiers_locked(void);
+
 static void post_init_once(void *ctx)
 {
     (void)ctx;
@@ -536,6 +556,12 @@ static void post_init_once(void *ctx)
     g_source  = CGEventSourceCreate(kCGEventSourceStatePrivate);
     g_lw_pid  = find_proc_by_name("loginwindow");
     { char b[96]; int l=snprintf(b,sizeof(b),"cg_fallback: source=%p lw_pid=%d\n",(void*)g_source,(int)g_lw_pid); write(STDOUT_FILENO,b,l); }
+    // Clear an OS-level latch inherited from a PREVIOUS process. A private event
+    // source stops us inheriting the system's modifier state into new events; it
+    // does nothing about a modifier the system itself still holds down. This is
+    // the only hook that covers a session whose process was killed outright, so
+    // it must run here rather than only on viewer re-attach.
+    release_stuck_modifiers_locked();
 }
 
 typedef struct { CGEventRef e; } PostCtx;
@@ -551,9 +577,14 @@ static void post_worker(void *arg)
     dispatch_semaphore_signal(g_postSem);
 }
 
-static void post_cgevent(CGEventRef e)
+// post_cgevent minus the dispatch_once_f guard, for callers that are already
+// running INSIDE post_init_once. Re-entering dispatch_once_f for a token still
+// in progress, from the same call stack, deadlocks or aborts in libdispatch --
+// measured live 2026-09-12 as an immediate crash on every session, which
+// launchd's KeepAlive then restarted in a tight loop. The viewer's black screen
+// was that crash loop, not a signing, entitlement or TCC problem.
+static void post_cgevent_locked(CGEventRef e)
 {
-    dispatch_once_f(&g_postOnce, NULL, post_init_once);
     // Wait briefly for a free slot rather than dropping immediately: input events
     // must not be silently discarded (see POST_MAX_INFLIGHT). Only give up if the
     // queue is still saturated after POST_WAIT_MS, and make that visible - the old
@@ -569,6 +600,60 @@ static void post_cgevent(CGEventRef e)
     CFRetain(e);
     c->e = e;
     dispatch_async_f(g_postQ, c, post_worker);
+}
+
+static void post_cgevent(CGEventRef e)
+{
+    dispatch_once_f(&g_postOnce, NULL, post_init_once);
+    post_cgevent_locked(e);
+}
+
+// Post a key-UP for every modifier, clearing any the OS still holds down.
+// A key-up for a modifier that is not down is a harmless no-op, so this is safe
+// to run unconditionally. Fn is included deliberately: a latched Fn turns 'e'
+// into Fn+E, which opens the Emoji picker -- the other half of the reported
+// symptom, seen with the remote key map ON.
+//
+// Caller must already have completed post_init_once.
+static void release_stuck_modifiers_locked(void)
+{
+    static const CGKeyCode mods[] = {
+        kVK_Shift,   kVK_RightShift,
+        kVK_Control, kVK_RightControl,
+        kVK_Option,  kVK_RightOption,
+        kVK_Command, kVK_RightCommand,
+        kVK_Function,
+    };
+    // Measurement, not decoration. This is the only place that can say whether a
+    // modifier was ACTUALLY latched, and it is logged before the release so the
+    // value is the evidence rather than the result. If the symptom recurs, this
+    // line answers "was a modifier stuck?" directly instead of by inference.
+    // Reading it after the release would prove nothing anyway: the posts below
+    // are queued asynchronously and have not been delivered yet.
+    CGEventFlags held = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+    { char b[128]; int l = snprintf(b, sizeof(b),
+        "release_stuck_modifiers: HID flags before release = 0x%llx%s\n",
+        (unsigned long long)held,
+        (held & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate
+                 | kCGEventFlagMaskCommand | kCGEventFlagMaskSecondaryFn)) ? "  <-- LATCHED" : "");
+      write(STDOUT_FILENO, b, l); }
+
+    for (size_t i = 0; i < sizeof(mods) / sizeof(mods[0]); i++)
+    {
+        CGEventRef e = CGEventCreateKeyboardEvent(g_source, mods[i], false);
+        if (!e) continue;
+        post_cgevent_locked(e);
+        CFRelease(e);   // post_cgevent_locked retains its own reference
+    }
+}
+
+// Same, for callers outside the init path.
+static void kvm_release_os_modifiers(void)
+{
+    // Guarantees post_init_once has finished before the unguarded post below.
+    // Not reentrant: we are not inside the once block here.
+    dispatch_once_f(&g_postOnce, NULL, post_init_once);
+    release_stuck_modifiers_locked();
 }
 
 // ---- VNC keyboard fallback implementation ----------------------------------
