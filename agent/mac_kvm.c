@@ -94,6 +94,31 @@ int KVM_SEND(char *buffer, int bufferLen)
 
 
 CGDirectDisplayID SCREEN_NUM = 0;
+
+// ---- Multi-display ---------------------------------------------------------
+// MeshCentral's protocol has had display enumeration and selection all along
+// (MNG_KVM_GET_DISPLAYS / MNG_KVM_SET_DISPLAY) and the Windows and Linux agents
+// both implement it. macOS never did: it hardcoded CGMainDisplayID(), so a Mac
+// with two monitors only ever showed one and the viewer's monitor picker never
+// appeared. The capture layer was already able to do this -- kvm_capture_sck()
+// takes a displayID and enumerates every SCDisplay -- it was simply always
+// handed the main one.
+#define KVM_MAX_DISPLAYS 16
+CGDirectDisplayID SCREEN_LIST[KVM_MAX_DISPLAYS];
+int SCREEN_COUNT = 0;
+int SCREEN_SEL   = 0;   // 1-based index into SCREEN_LIST; 0 = none chosen = main
+
+// Origin of the selected display in the global coordinate space.
+//
+// Mouse coordinates arrive relative to the top-left of the CAPTURED display,
+// but CGEventCreateMouseEvent() takes GLOBAL coordinates. For the main display
+// the origin is (0,0), which is why single-display worked without ever
+// consulting this. A second monitor does not sit at the origin -- measured on
+// the test VM it is at (1132,0) -- so without this every click on that monitor
+// would land on the first one.
+int SCREEN_ORIGIN_X = 0;
+int SCREEN_ORIGIN_Y = 0;
+
 int SH_HANDLE = 0;
 int SCREEN_WIDTH = 0;
 int SCREEN_HEIGHT = 0;
@@ -159,6 +184,78 @@ void kvm_send_resolution()
 
 
 	// Write the reply to the pipe.
+	ILibQueue_Lock(g_messageQ);
+	ILibQueue_EnQueue(g_messageQ, buffer);
+	ILibQueue_UnLock(g_messageQ);
+}
+
+// Rebuild SCREEN_LIST from the OS.
+//
+// Mirrored displays are skipped: they show the same pixels as the display they
+// mirror, so listing them would offer the operator duplicate entries that all
+// look identical.
+void kvm_refresh_display_list(void)
+{
+	CGDirectDisplayID ids[KVM_MAX_DISPLAYS];
+	uint32_t n = 0;
+	if (CGGetActiveDisplayList(KVM_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) n = 0;
+
+	SCREEN_COUNT = 0;
+	for (uint32_t i = 0; i < n && SCREEN_COUNT < KVM_MAX_DISPLAYS; i++)
+	{
+		if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay) continue;
+		SCREEN_LIST[SCREEN_COUNT++] = ids[i];
+	}
+	if (SCREEN_COUNT == 0) { SCREEN_LIST[0] = CGMainDisplayID(); SCREEN_COUNT = 1; }
+	// A display can be unplugged mid-session; fall back to the main one rather
+	// than capturing an ID that no longer exists.
+	if (SCREEN_SEL > SCREEN_COUNT) SCREEN_SEL = 0;
+}
+
+CGDirectDisplayID kvm_selected_display(void)
+{
+	if (SCREEN_SEL >= 1 && SCREEN_SEL <= SCREEN_COUNT) return SCREEN_LIST[SCREEN_SEL - 1];
+	return CGMainDisplayID();
+}
+
+// Tell the viewer which displays exist. Wire format matches the Windows agent:
+// [type][size][count][id...][selected], 2 bytes each, count = number of ids.
+//
+// The "all displays as one image" entry (65535) that Windows offers is NOT
+// advertised: SCContentFilter is per-display, so a combined view needs a
+// composite over the union rect that does not exist yet. Better to offer only
+// what actually works than to list an option that returns a blank screen.
+void kvm_send_display_list(void)
+{
+	kvm_refresh_display_list();
+
+	if (SCREEN_COUNT <= 1)
+	{
+		// One display: send the empty form, as Windows does, so the viewer hides
+		// its monitor picker rather than showing a picker with one entry.
+		char *buffer = ILibMemory_SmartAllocate(8);
+		((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);
+		((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)8);
+		((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)0);
+		((unsigned short*)buffer)[3] = (unsigned short)htons((unsigned short)0);
+		ILibQueue_Lock(g_messageQ);
+		ILibQueue_EnQueue(g_messageQ, buffer);
+		ILibQueue_UnLock(g_messageQ);
+		return;
+	}
+
+	int n   = SCREEN_COUNT;
+	int sel = (SCREEN_SEL >= 1 && SCREEN_SEL <= n) ? SCREEN_SEL : 1;
+	int sz  = 8 + (2 * n);
+	char *buffer = ILibMemory_SmartAllocate(sz);
+	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);
+	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)sz);
+	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)n);
+	for (int i = 0; i < n; i++)
+		((unsigned short*)buffer)[3 + i] = (unsigned short)htons((unsigned short)(i + 1));
+	((unsigned short*)buffer)[3 + n] = (unsigned short)htons((unsigned short)sel);
+
+	kvm_flog("kvm_send_display_list: count=%d selected=%d\n", n, sel);
 	ILibQueue_Lock(g_messageQ);
 	ILibQueue_EnQueue(g_messageQ, buffer);
 	ILibQueue_UnLock(g_messageQ);
@@ -303,7 +400,16 @@ int kvm_init()
 	ILibCriticalLogFilename = "KVMSlave.log";
 	int old_height_count = TILE_HEIGHT_COUNT;
 
-	SCREEN_NUM = CGMainDisplayID();
+	kvm_refresh_display_list();
+	SCREEN_NUM = kvm_selected_display();
+	{
+		CGRect b = CGDisplayBounds(SCREEN_NUM);
+		SCREEN_ORIGIN_X = (int)b.origin.x;
+		SCREEN_ORIGIN_Y = (int)b.origin.y;
+		kvm_flog("kvm_init: display %d/%d id=%u origin=(%d,%d)\n",
+			SCREEN_SEL ? SCREEN_SEL : 1, SCREEN_COUNT, SCREEN_NUM,
+			SCREEN_ORIGIN_X, SCREEN_ORIGIN_Y);
+	}
 	if (__builtin_available(macOS 10.15, *))
 	{
 		// Check (but do NOT request) TCC screen capture access.
@@ -356,6 +462,10 @@ int kvm_init()
 	
 	kvm_flog("kvm_init: calling kvm_send_resolution\n");
 	kvm_send_resolution();
+	// Advertise the display list unprompted. The viewer does ask for it, but
+	// sending it alongside the resolution means the monitor picker is populated
+	// from the first frame instead of only after a round trip.
+	kvm_send_display_list();
 	kvm_flog("kvm_init: calling reset_tile_info\n");
 	reset_tile_info(old_height_count);
 	kvm_flog("kvm_init: building keystate\n");
@@ -469,6 +579,30 @@ int kvm_server_inputdata(char* block, int blocklen)
 		{
 			//int fr = ((int)ntohs(((unsigned short*)(block))[2]));
 			//if (fr > 20 && fr < 2000) FRAME_RATE_TIMER = fr;
+			break;
+		}
+		case MNG_KVM_GET_DISPLAYS:
+		{
+			kvm_send_display_list();
+			break;
+		}
+		case MNG_KVM_SET_DISPLAY:
+		{
+			if (size < 6) break;
+			unsigned short v = ntohs(((unsigned short*)(block))[2]);
+			kvm_refresh_display_list();
+			// 65535 means "all displays" in this protocol. We do not advertise
+			// that option (no composite capture yet), but a viewer can still ask
+			// for it -- fall back to the first display rather than blanking.
+			int newsel = (v == 65535) ? 1 : (int)v;
+			if (newsel < 1 || newsel > SCREEN_COUNT) break;
+			if (newsel == SCREEN_SEL) break;
+			SCREEN_SEL = newsel;
+			kvm_flog("MNG_KVM_SET_DISPLAY: -> %d/%d (id=%u)\n",
+				SCREEN_SEL, SCREEN_COUNT, kvm_selected_display());
+			// No further work needed here: the main loop compares SCREEN_NUM with
+			// the selected display every frame and already re-runs kvm_init() on a
+			// change, which re-sends the resolution and rebuilds the tile cache.
 			break;
 		}
 	}
@@ -806,7 +940,7 @@ void* kvm_server_mainloop(void* param)
 			}
 		}
 
-		screen_num = CGMainDisplayID();
+		screen_num = kvm_selected_display();
 		static int logged_once = 0;
 		if (!logged_once) { kvm_flog("MainLoop start: CGMainDisplayID=%u\n", screen_num); logged_once = 1; }
 

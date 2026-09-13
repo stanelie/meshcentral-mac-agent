@@ -187,10 +187,10 @@ index b70a508..b6d96b5 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..2762179 100644
+index c27e1f0..5903af8 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,1221 @@
+@@ -2,13 +2,1287 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -293,10 +293,68 @@ index c27e1f0..2762179 100644
 +    }
 +}
 +
-+// Apply our tracked modifiers on top of the event's own keycode-derived flags.
++// Set the event's modifiers to EXACTLY what the remote user is holding.
++//
++// This used to OR g_modFlags onto whatever flags the event already carried, and
++// that was the bug behind "one letter stops typing, forever".
++//
++// CGEventCreateKeyboardEvent() does not hand back a blank event: it inherits the
++// modifier state accumulated by its EVENT SOURCE. Measured 2026-09-13 --
++//     fresh private source:           event flags = 0x20000000
++//     after an unmatched Shift DOWN:  event flags = 0x20020002 SHIFT
++// -- so a modifier whose key-DOWN was injected and whose key-UP never arrived
++// (viewer disconnected mid-keystroke, a dropped frame) leaves that flag riding
++// on EVERY event the agent creates from then on. ORing could never clear it.
++//
++// That state lives in the source, i.e. in this process, which is why the symptom
++// survived reconnects (the kvmagent does not restart per session -- measured at
++// 17h uptime serving one session), was invisible in
++// CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState), did not affect
++// other remote-control tools, and vanished the moment the agent was restarted.
++//
++// Why a single letter: a latched Fn turns 'e' into Fn+E, the Emoji picker
++// shortcut. Chromium-based apps derive the character from keycode + flags and so
++// swallowed it as a shortcut, while native apps honoured the Unicode string
++// attached by CGEventKeyboardSetUnicodeString and still typed 'e' -- exactly the
++// reported split (broken in an Electron app, fine in Finder). Shift+E did not
++// match the shortcut, so capital E kept working throughout.
++//
++// g_modFlags is the agent's own record of what the remote user is holding, and
++// it is updated BEFORE the event is created, so it is authoritative for modifier
++// keys too. Anything else on the event is something nobody pressed.
 +static void kvm_apply_mod_flags(CGEventRef e)
 +{
-+    CGEventSetFlags(e, CGEventGetFlags(e) | g_modFlags);
++    const CGEventFlags kReal = kCGEventFlagMaskShift | kCGEventFlagMaskControl
++                             | kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand
++                             | kCGEventFlagMaskSecondaryFn;
++    CGEventFlags had    = CGEventGetFlags(e);
++    CGEventFlags leaked = (had & kReal) & ~g_modFlags;
++    if (leaked)
++    {
++        // Nobody pressed these. This is the exact signature of the bug, and it
++        // went undiagnosed for a long time purely because no line recorded it --
++        // the existing key diagnostics write to stdout, which launchd discards.
++        // Rate-limited: one line per 5s is enough to spot a latch, and this runs
++        // on every injected event.
++        static time_t last = 0;
++        time_t now = time(NULL);
++        if (now - last >= 5)
++        {
++            last = now;
++            FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
++            if (_f)
++            {
++                fprintf(_f, "FLAG-LEAK inherited=0x%llx tracked=0x%llx leaked=0x%llx t=%ld\n",
++                    (unsigned long long)(had & kReal), (unsigned long long)g_modFlags,
++                    (unsigned long long)leaked, (long)now);
++                fclose(_f);
++            }
++        }
++    }
++    // Caps Lock is kept: it is a real latching toggle on the physical machine
++    // rather than leaked state, and stripping it would change unrelated
++    // behaviour. Everything else comes from g_modFlags alone.
++    CGEventSetFlags(e, g_modFlags | (had & kCGEventFlagMaskAlphaShift));
 +}
 +
 +// Release any modifier the OS still believes is held down. Defined further
@@ -802,6 +860,14 @@ index c27e1f0..2762179 100644
 +}
 +
 +// Post a key-UP for every modifier, clearing any the OS still holds down.
++//
++// NOTE ON SCOPE: this is NOT the fix for the "one letter stops typing" bug --
++// see kvm_apply_mod_flags for that. When that bug was finally caught live on
++// 2026-09-13 this function had never run, and the OS-level state it targets was
++// clean while the symptom was present. It is kept because a system-level latch
++// was separately observed once (Fn set in kCGEventSourceStateHIDSystemState),
++// and clearing it is free -- but it addresses a different layer, and it should
++// not be mistaken for the cause of anything again.
 +// A key-up for a modifier that is not down is a harmless no-op, so this is safe
 +// to run unconditionally. Fn is included deliberately: a latched Fn turns 'e'
 +// into Fn+E, which opens the Emoji picker -- the other half of the reported
@@ -1415,7 +1481,7 @@ index c27e1f0..2762179 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1340,324 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1406,343 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
@@ -1538,6 +1604,18 @@ index c27e1f0..2762179 100644
 +        return;
 +    }
 +
++    // Coordinates arrive relative to the top-left of the CAPTURED display; the
++    // CGEvent APIs below take GLOBAL coordinates. Add the selected display's
++    // origin, which is (0,0) for the main display -- that is why this was never
++    // needed while the agent only ever captured the main one, and why a second
++    // monitor (measured at origin 1132,0 on the test VM) would otherwise put
++    // every click on the wrong screen.
++    //
++    // Deliberately AFTER the login-window branch: that path talks to
++    // screensharingd, whose framebuffer has its own coordinate space.
++    { extern int SCREEN_ORIGIN_X; extern int SCREEN_ORIGIN_Y;
++      absX += SCREEN_ORIGIN_X; absY += SCREEN_ORIGIN_Y; }
++
 +    // In-session path: virtual HID device if we have one, else CGEvent.
 +    if (g_mouse_dev) {
 +        MouseReport r = {0};
@@ -1567,7 +1645,12 @@ index c27e1f0..2762179 100644
 +		if (_px == 0) _px = (wheel > 0) ? 1 : -1;          // keep tiny scrolls alive
 +		if (_px > 160) _px = 160; else if (_px < -160) _px = -160;
 +		e = CGEventCreateScrollWheelEvent(g_source, kCGScrollEventUnitPixel, 1, (int32_t)_px);
-+		if (e) { post_cgevent(e); CFRelease(e); }
++		// Mouse events inherit the source's modifier state just as key events do,
++		// so they get the same authoritative treatment -- otherwise a latched
++		// Command would turn every scroll into a zoom and every click into a
++		// Command-click. It also makes Shift-click and Command-click work from the
++		// remote, which follow g_modFlags like any other modifier combination.
++		if (e) { kvm_apply_mod_flags(e); post_cgevent(e); CFRelease(e); }
 +		return;
 +	}
 +	if (button == 0) {
@@ -1580,6 +1663,7 @@ index c27e1f0..2762179 100644
 +		e = CGEventCreateMouseEvent(g_source, mtype, CGPointMake(absX, absY), mbtn);
 +		// Drag events carry the click state of the click that started them, so a
 +		// double-click-and-drag (e.g. text selection by word) behaves correctly.
++		if (e) kvm_apply_mod_flags(e);
 +		if (e && mtype != kCGEventMouseMoved) {
 +			CGEventSetIntegerValueField(e, kCGMouseEventClickState,
 +			    g_clickCount > 0 ? g_clickCount : 1);
@@ -1644,6 +1728,7 @@ index c27e1f0..2762179 100644
 -			e = CGEventCreateMouseEvent(source, event, curPos, 1);
 -			CGEventPost(kCGHIDEventTap, e);
 +		e = CGEventCreateMouseEvent(g_source, etype, CGPointMake(absX, absY), mbtn);
++		if (e) kvm_apply_mod_flags(e);
 +		// The matching Up must carry the same click state as its Down, or the
 +		// click is not recognised as part of a double/triple click.
 +		if (e) {
@@ -1894,7 +1979,7 @@ index d6bb534..94eb8b0 100644
  #endif /* LINUX_EVENTS_H_ */
 +void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..2113f3f 100644
+index 6d57690..c172978 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -1927,13 +2012,134 @@ index 6d57690..2113f3f 100644
  
  int KVM_Listener_FD = -1;
  // Socket path used when kvm_server_mainloop runs in socket-listener
-@@ -289,8 +302,22 @@ int kvm_init()
+@@ -81,6 +94,31 @@ int KVM_SEND(char *buffer, int bufferLen)
+ 
+ 
+ CGDirectDisplayID SCREEN_NUM = 0;
++
++// ---- Multi-display ---------------------------------------------------------
++// MeshCentral's protocol has had display enumeration and selection all along
++// (MNG_KVM_GET_DISPLAYS / MNG_KVM_SET_DISPLAY) and the Windows and Linux agents
++// both implement it. macOS never did: it hardcoded CGMainDisplayID(), so a Mac
++// with two monitors only ever showed one and the viewer's monitor picker never
++// appeared. The capture layer was already able to do this -- kvm_capture_sck()
++// takes a displayID and enumerates every SCDisplay -- it was simply always
++// handed the main one.
++#define KVM_MAX_DISPLAYS 16
++CGDirectDisplayID SCREEN_LIST[KVM_MAX_DISPLAYS];
++int SCREEN_COUNT = 0;
++int SCREEN_SEL   = 0;   // 1-based index into SCREEN_LIST; 0 = none chosen = main
++
++// Origin of the selected display in the global coordinate space.
++//
++// Mouse coordinates arrive relative to the top-left of the CAPTURED display,
++// but CGEventCreateMouseEvent() takes GLOBAL coordinates. For the main display
++// the origin is (0,0), which is why single-display worked without ever
++// consulting this. A second monitor does not sit at the origin -- measured on
++// the test VM it is at (1132,0) -- so without this every click on that monitor
++// would land on the first one.
++int SCREEN_ORIGIN_X = 0;
++int SCREEN_ORIGIN_Y = 0;
++
+ int SH_HANDLE = 0;
+ int SCREEN_WIDTH = 0;
+ int SCREEN_HEIGHT = 0;
+@@ -151,6 +189,78 @@ void kvm_send_resolution()
+ 	ILibQueue_UnLock(g_messageQ);
+ }
+ 
++// Rebuild SCREEN_LIST from the OS.
++//
++// Mirrored displays are skipped: they show the same pixels as the display they
++// mirror, so listing them would offer the operator duplicate entries that all
++// look identical.
++void kvm_refresh_display_list(void)
++{
++	CGDirectDisplayID ids[KVM_MAX_DISPLAYS];
++	uint32_t n = 0;
++	if (CGGetActiveDisplayList(KVM_MAX_DISPLAYS, ids, &n) != kCGErrorSuccess) n = 0;
++
++	SCREEN_COUNT = 0;
++	for (uint32_t i = 0; i < n && SCREEN_COUNT < KVM_MAX_DISPLAYS; i++)
++	{
++		if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay) continue;
++		SCREEN_LIST[SCREEN_COUNT++] = ids[i];
++	}
++	if (SCREEN_COUNT == 0) { SCREEN_LIST[0] = CGMainDisplayID(); SCREEN_COUNT = 1; }
++	// A display can be unplugged mid-session; fall back to the main one rather
++	// than capturing an ID that no longer exists.
++	if (SCREEN_SEL > SCREEN_COUNT) SCREEN_SEL = 0;
++}
++
++CGDirectDisplayID kvm_selected_display(void)
++{
++	if (SCREEN_SEL >= 1 && SCREEN_SEL <= SCREEN_COUNT) return SCREEN_LIST[SCREEN_SEL - 1];
++	return CGMainDisplayID();
++}
++
++// Tell the viewer which displays exist. Wire format matches the Windows agent:
++// [type][size][count][id...][selected], 2 bytes each, count = number of ids.
++//
++// The "all displays as one image" entry (65535) that Windows offers is NOT
++// advertised: SCContentFilter is per-display, so a combined view needs a
++// composite over the union rect that does not exist yet. Better to offer only
++// what actually works than to list an option that returns a blank screen.
++void kvm_send_display_list(void)
++{
++	kvm_refresh_display_list();
++
++	if (SCREEN_COUNT <= 1)
++	{
++		// One display: send the empty form, as Windows does, so the viewer hides
++		// its monitor picker rather than showing a picker with one entry.
++		char *buffer = ILibMemory_SmartAllocate(8);
++		((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);
++		((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)8);
++		((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)0);
++		((unsigned short*)buffer)[3] = (unsigned short)htons((unsigned short)0);
++		ILibQueue_Lock(g_messageQ);
++		ILibQueue_EnQueue(g_messageQ, buffer);
++		ILibQueue_UnLock(g_messageQ);
++		return;
++	}
++
++	int n   = SCREEN_COUNT;
++	int sel = (SCREEN_SEL >= 1 && SCREEN_SEL <= n) ? SCREEN_SEL : 1;
++	int sz  = 8 + (2 * n);
++	char *buffer = ILibMemory_SmartAllocate(sz);
++	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);
++	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)sz);
++	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)n);
++	for (int i = 0; i < n; i++)
++		((unsigned short*)buffer)[3 + i] = (unsigned short)htons((unsigned short)(i + 1));
++	((unsigned short*)buffer)[3 + n] = (unsigned short)htons((unsigned short)sel);
++
++	kvm_flog("kvm_send_display_list: count=%d selected=%d\n", n, sel);
++	ILibQueue_Lock(g_messageQ);
++	ILibQueue_EnQueue(g_messageQ, buffer);
++	ILibQueue_UnLock(g_messageQ);
++}
++
+ #define BUFSIZE 65535
+ 
+ int set_kbd_state(int input_state)
+@@ -289,8 +399,31 @@ int kvm_init()
  {
  	ILibCriticalLogFilename = "KVMSlave.log";
  	int old_height_count = TILE_HEIGHT_COUNT;
 -	
+-	SCREEN_NUM = CGMainDisplayID();
 +
- 	SCREEN_NUM = CGMainDisplayID();
++	kvm_refresh_display_list();
++	SCREEN_NUM = kvm_selected_display();
++	{
++		CGRect b = CGDisplayBounds(SCREEN_NUM);
++		SCREEN_ORIGIN_X = (int)b.origin.x;
++		SCREEN_ORIGIN_Y = (int)b.origin.y;
++		kvm_flog("kvm_init: display %d/%d id=%u origin=(%d,%d)\n",
++			SCREEN_SEL ? SCREEN_SEL : 1, SCREEN_COUNT, SCREEN_NUM,
++			SCREEN_ORIGIN_X, SCREEN_ORIGIN_Y);
++	}
 +	if (__builtin_available(macOS 10.15, *))
 +	{
 +		// Check (but do NOT request) TCC screen capture access.
@@ -1951,7 +2157,7 @@ index 6d57690..2113f3f 100644
  	
  	if (SCREEN_WIDTH > 0)
  	{
-@@ -299,8 +326,23 @@ int kvm_init()
+@@ -299,8 +432,23 @@ int kvm_init()
  		CGDisplayModeRelease(mode);
  	}
  
@@ -1975,12 +2181,16 @@ index 6d57690..2113f3f 100644
  	// Some magic numbers.
  	TILE_WIDTH = 32;
  	TILE_HEIGHT = 32;
-@@ -312,13 +354,20 @@ int kvm_init()
+@@ -312,13 +460,24 @@ int kvm_init()
  	if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
  	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
  	
 +	kvm_flog("kvm_init: calling kvm_send_resolution\n");
  	kvm_send_resolution();
++	// Advertise the display list unprompted. The viewer does ask for it, but
++	// sending it alongside the resolution means the monitor picker is populated
++	// from the first frame instead of only after a round trip.
++	kvm_send_display_list();
 +	kvm_flog("kvm_init: calling reset_tile_info\n");
  	reset_tile_info(old_height_count);
 -	
@@ -1998,7 +2208,7 @@ index 6d57690..2113f3f 100644
  
  	// Write the reply to the pipe.
  	ILibQueue_Lock(g_messageQ);
-@@ -341,6 +390,12 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -341,6 +500,12 @@ int kvm_server_inputdata(char* block, int blocklen)
  	type = ntohs(((unsigned short*)(block))[0]);
  	size = ntohs(((unsigned short*)(block))[1]);
  
@@ -2011,7 +2221,38 @@ index 6d57690..2113f3f 100644
  	if (size > blocklen) return 0;
  
  	switch (type)
-@@ -484,7 +539,7 @@ void* kvm_mainloopinput(void* param)
+@@ -416,6 +581,30 @@ int kvm_server_inputdata(char* block, int blocklen)
+ 			//if (fr > 20 && fr < 2000) FRAME_RATE_TIMER = fr;
+ 			break;
+ 		}
++		case MNG_KVM_GET_DISPLAYS:
++		{
++			kvm_send_display_list();
++			break;
++		}
++		case MNG_KVM_SET_DISPLAY:
++		{
++			if (size < 6) break;
++			unsigned short v = ntohs(((unsigned short*)(block))[2]);
++			kvm_refresh_display_list();
++			// 65535 means "all displays" in this protocol. We do not advertise
++			// that option (no composite capture yet), but a viewer can still ask
++			// for it -- fall back to the first display rather than blanking.
++			int newsel = (v == 65535) ? 1 : (int)v;
++			if (newsel < 1 || newsel > SCREEN_COUNT) break;
++			if (newsel == SCREEN_SEL) break;
++			SCREEN_SEL = newsel;
++			kvm_flog("MNG_KVM_SET_DISPLAY: -> %d/%d (id=%u)\n",
++				SCREEN_SEL, SCREEN_COUNT, kvm_selected_display());
++			// No further work needed here: the main loop compares SCREEN_NUM with
++			// the selected display every frame and already re-runs kvm_init() on a
++			// change, which re-sends the resolution and rebuilds the tile cache.
++			break;
++		}
+ 	}
+ 
+ 	return size;
+@@ -484,7 +673,7 @@ void* kvm_mainloopinput(void* param)
  	int ptr = 0;
  	int ptr2 = 0;
  	int len = 0;
@@ -2020,7 +2261,7 @@ index 6d57690..2113f3f 100644
  	int cbBytesRead = 0;
  
  	char tmp[255];
-@@ -507,6 +562,35 @@ void* kvm_mainloopinput(void* param)
+@@ -507,6 +696,35 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		KvmDebugLog("Reading from master in kvm_mainloopinput\n");
@@ -2056,7 +2297,7 @@ index 6d57690..2113f3f 100644
  		cbBytesRead = read(KVM_AGENT_FD == -1 ? STDIN_FILENO: KVM_AGENT_FD, pchRequest2 + len, 30000 - len);
  		KvmDebugLog("Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
  
-@@ -539,7 +623,7 @@ void* kvm_mainloopinput(void* param)
+@@ -539,7 +757,7 @@ void* kvm_mainloopinput(void* param)
  			write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
  		}
@@ -2065,7 +2306,7 @@ index 6d57690..2113f3f 100644
  
  		if (KVM_AGENT_FD != -1)
  		{
-@@ -549,7 +633,7 @@ void* kvm_mainloopinput(void* param)
+@@ -549,7 +767,7 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		if (ptr == len) { len = 0; ptr = 0; }
@@ -2074,7 +2315,7 @@ index 6d57690..2113f3f 100644
  	}
  
  	return 0;
-@@ -557,16 +641,11 @@ void* kvm_mainloopinput(void* param)
+@@ -557,16 +775,11 @@ void* kvm_mainloopinput(void* param)
  void ExitSink(int s)
  {
  	UNREFERENCED_PARAMETER(s);
@@ -2096,7 +2337,7 @@ index 6d57690..2113f3f 100644
  }
  void* kvm_server_mainloop(void* param)
  {
-@@ -637,6 +716,7 @@ void* kvm_server_mainloop(void* param)
+@@ -637,6 +850,7 @@ void* kvm_server_mainloop(void* param)
  		{
  			written = write(STDOUT_FILENO, "ACCEPT ERROR ON DOMAIN SOCKET", 29);
  			fsync(STDOUT_FILENO);
@@ -2104,7 +2345,7 @@ index 6d57690..2113f3f 100644
  			return(NULL);
  		}
  		else
-@@ -645,12 +725,15 @@ void* kvm_server_mainloop(void* param)
+@@ -645,12 +859,15 @@ void* kvm_server_mainloop(void* param)
  			int tmpLen = sprintf_s(tmp, sizeof(tmp), "ACCEPTed new connection %d on Domain Socket\n", KVM_AGENT_FD);
  			written = write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
@@ -2122,10 +2363,12 @@ index 6d57690..2113f3f 100644
  
  
  	g_shutdown = 0;
-@@ -724,9 +807,11 @@ void* kvm_server_mainloop(void* param)
+@@ -723,10 +940,12 @@ void* kvm_server_mainloop(void* param)
+ 			}
  		}
  
- 		screen_num = CGMainDisplayID();
+-		screen_num = CGMainDisplayID();
++		screen_num = kvm_selected_display();
 +		static int logged_once = 0;
 +		if (!logged_once) { kvm_flog("MainLoop start: CGMainDisplayID=%u\n", screen_num); logged_once = 1; }
 +
@@ -2136,7 +2379,7 @@ index 6d57690..2113f3f 100644
  		if (SCREEN_SCALE_SET == 0)
  		{
  			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
-@@ -741,19 +826,143 @@ void* kvm_server_mainloop(void* param)
+@@ -741,19 +960,143 @@ void* kvm_server_mainloop(void* param)
  		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
  		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
  		
@@ -2157,9 +2400,7 @@ index 6d57690..2113f3f 100644
 +		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 +		CGImageRef image = NULL;
 +		if (getuid() == 0)
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
 +			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
 +			// back to the standard CoreGraphics capture APIs: on a PHYSICAL Mac (not
@@ -2276,7 +2517,9 @@ index 6d57690..2113f3f 100644
 +			image = kvm_capture_sck((uint32_t)screen_num);
 +		}
 +		if (image == NULL)
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// All capture APIs failed. Sleep 1s and retry rather than exiting —
 +			// launchd won't restart on exit(0), and SCK needs time to settle.
 +			static int all_logged = 0;
@@ -2286,7 +2529,7 @@ index 6d57690..2113f3f 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1197,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1331,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -2312,7 +2555,7 @@ index 6d57690..2113f3f 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1278,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1412,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -2374,7 +2617,7 @@ index 6d57690..2113f3f 100644
  	}
  }
  
-@@ -1150,6 +1403,402 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,6 +1537,402 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -2777,7 +3020,7 @@ index 6d57690..2113f3f 100644
  void kvm_check_permission()
  {
  
-@@ -1190,4 +1839,60 @@ void kvm_check_permission()
+@@ -1190,4 +1973,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

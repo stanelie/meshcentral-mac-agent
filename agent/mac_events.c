@@ -100,10 +100,68 @@ static CGEventFlags vk_mod_flag(unsigned char vk)
     }
 }
 
-// Apply our tracked modifiers on top of the event's own keycode-derived flags.
+// Set the event's modifiers to EXACTLY what the remote user is holding.
+//
+// This used to OR g_modFlags onto whatever flags the event already carried, and
+// that was the bug behind "one letter stops typing, forever".
+//
+// CGEventCreateKeyboardEvent() does not hand back a blank event: it inherits the
+// modifier state accumulated by its EVENT SOURCE. Measured 2026-09-13 --
+//     fresh private source:           event flags = 0x20000000
+//     after an unmatched Shift DOWN:  event flags = 0x20020002 SHIFT
+// -- so a modifier whose key-DOWN was injected and whose key-UP never arrived
+// (viewer disconnected mid-keystroke, a dropped frame) leaves that flag riding
+// on EVERY event the agent creates from then on. ORing could never clear it.
+//
+// That state lives in the source, i.e. in this process, which is why the symptom
+// survived reconnects (the kvmagent does not restart per session -- measured at
+// 17h uptime serving one session), was invisible in
+// CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState), did not affect
+// other remote-control tools, and vanished the moment the agent was restarted.
+//
+// Why a single letter: a latched Fn turns 'e' into Fn+E, the Emoji picker
+// shortcut. Chromium-based apps derive the character from keycode + flags and so
+// swallowed it as a shortcut, while native apps honoured the Unicode string
+// attached by CGEventKeyboardSetUnicodeString and still typed 'e' -- exactly the
+// reported split (broken in an Electron app, fine in Finder). Shift+E did not
+// match the shortcut, so capital E kept working throughout.
+//
+// g_modFlags is the agent's own record of what the remote user is holding, and
+// it is updated BEFORE the event is created, so it is authoritative for modifier
+// keys too. Anything else on the event is something nobody pressed.
 static void kvm_apply_mod_flags(CGEventRef e)
 {
-    CGEventSetFlags(e, CGEventGetFlags(e) | g_modFlags);
+    const CGEventFlags kReal = kCGEventFlagMaskShift | kCGEventFlagMaskControl
+                             | kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand
+                             | kCGEventFlagMaskSecondaryFn;
+    CGEventFlags had    = CGEventGetFlags(e);
+    CGEventFlags leaked = (had & kReal) & ~g_modFlags;
+    if (leaked)
+    {
+        // Nobody pressed these. This is the exact signature of the bug, and it
+        // went undiagnosed for a long time purely because no line recorded it --
+        // the existing key diagnostics write to stdout, which launchd discards.
+        // Rate-limited: one line per 5s is enough to spot a latch, and this runs
+        // on every injected event.
+        static time_t last = 0;
+        time_t now = time(NULL);
+        if (now - last >= 5)
+        {
+            last = now;
+            FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
+            if (_f)
+            {
+                fprintf(_f, "FLAG-LEAK inherited=0x%llx tracked=0x%llx leaked=0x%llx t=%ld\n",
+                    (unsigned long long)(had & kReal), (unsigned long long)g_modFlags,
+                    (unsigned long long)leaked, (long)now);
+                fclose(_f);
+            }
+        }
+    }
+    // Caps Lock is kept: it is a real latching toggle on the physical machine
+    // rather than leaked state, and stripping it would change unrelated
+    // behaviour. Everything else comes from g_modFlags alone.
+    CGEventSetFlags(e, g_modFlags | (had & kCGEventFlagMaskAlphaShift));
 }
 
 // Release any modifier the OS still believes is held down. Defined further
@@ -609,6 +667,14 @@ static void post_cgevent(CGEventRef e)
 }
 
 // Post a key-UP for every modifier, clearing any the OS still holds down.
+//
+// NOTE ON SCOPE: this is NOT the fix for the "one letter stops typing" bug --
+// see kvm_apply_mod_flags for that. When that bug was finally caught live on
+// 2026-09-13 this function had never run, and the OS-level state it targets was
+// clean while the symptom was present. It is kept because a system-level latch
+// was separately observed once (Fn set in kCGEventSourceStateHIDSystemState),
+// and clearing it is free -- but it addresses a different layer, and it should
+// not be mistaken for the cause of anything again.
 // A key-up for a modifier that is not down is a harmless no-op, so this is safe
 // to run unconditionally. Fn is included deliberately: a latched Fn turns 'e'
 // into Fn+E, which opens the Emoji picker -- the other half of the reported
@@ -1399,6 +1465,18 @@ void MouseAction(double absX, double absY, int button, short wheel)
         return;
     }
 
+    // Coordinates arrive relative to the top-left of the CAPTURED display; the
+    // CGEvent APIs below take GLOBAL coordinates. Add the selected display's
+    // origin, which is (0,0) for the main display -- that is why this was never
+    // needed while the agent only ever captured the main one, and why a second
+    // monitor (measured at origin 1132,0 on the test VM) would otherwise put
+    // every click on the wrong screen.
+    //
+    // Deliberately AFTER the login-window branch: that path talks to
+    // screensharingd, whose framebuffer has its own coordinate space.
+    { extern int SCREEN_ORIGIN_X; extern int SCREEN_ORIGIN_Y;
+      absX += SCREEN_ORIGIN_X; absY += SCREEN_ORIGIN_Y; }
+
     // In-session path: virtual HID device if we have one, else CGEvent.
     if (g_mouse_dev) {
         MouseReport r = {0};
@@ -1428,7 +1506,12 @@ void MouseAction(double absX, double absY, int button, short wheel)
 		if (_px == 0) _px = (wheel > 0) ? 1 : -1;          // keep tiny scrolls alive
 		if (_px > 160) _px = 160; else if (_px < -160) _px = -160;
 		e = CGEventCreateScrollWheelEvent(g_source, kCGScrollEventUnitPixel, 1, (int32_t)_px);
-		if (e) { post_cgevent(e); CFRelease(e); }
+		// Mouse events inherit the source's modifier state just as key events do,
+		// so they get the same authoritative treatment -- otherwise a latched
+		// Command would turn every scroll into a zoom and every click into a
+		// Command-click. It also makes Shift-click and Command-click work from the
+		// remote, which follow g_modFlags like any other modifier combination.
+		if (e) { kvm_apply_mod_flags(e); post_cgevent(e); CFRelease(e); }
 		return;
 	}
 	if (button == 0) {
@@ -1441,6 +1524,7 @@ void MouseAction(double absX, double absY, int button, short wheel)
 		e = CGEventCreateMouseEvent(g_source, mtype, CGPointMake(absX, absY), mbtn);
 		// Drag events carry the click state of the click that started them, so a
 		// double-click-and-drag (e.g. text selection by word) behaves correctly.
+		if (e) kvm_apply_mod_flags(e);
 		if (e && mtype != kCGEventMouseMoved) {
 			CGEventSetIntegerValueField(e, kCGMouseEventClickState,
 			    g_clickCount > 0 ? g_clickCount : 1);
@@ -1474,6 +1558,7 @@ void MouseAction(double absX, double absY, int button, short wheel)
 			g_lastClickY = absY;
 		}
 		e = CGEventCreateMouseEvent(g_source, etype, CGPointMake(absX, absY), mbtn);
+		if (e) kvm_apply_mod_flags(e);
 		// The matching Up must carry the same click state as its Down, or the
 		// click is not recognised as part of a double/triple click.
 		if (e) {
