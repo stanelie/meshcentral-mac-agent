@@ -38,11 +38,51 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
 esac
 echo "Downloading agent for $(uname -m) ..."
+# Remember what was there, so this run can say whether it actually changed
+# anything. Re-running over an existing install otherwise prints the same text
+# either way and looks like it did nothing -- reported 2026-09-13 by an operator
+# who had in fact just upgraded two builds.
+PREV_SUM=""
+[ -f "$D/$EXE" ] && PREV_SUM="$(/usr/bin/shasum -a 256 "$D/$EXE" 2>/dev/null | cut -c1-8)"
 # Clear the immutable flag first (see the kvm/ copy below for why anyone would
 # have set it) -- otherwise curl fails with EPERM even as root.
 chflags nouchg "$D/$EXE" 2>/dev/null || true
-if ! curl -fsSL "$BIN_URL" -o "$D/$EXE"; then echo "ERROR: could not download $BIN_URL"; exit 1; fi
-chmod 755 "$D/$EXE"; chown root:wheel "$D/$EXE"
+# Download beside the target, then RENAME over it -- never write in place.
+#
+# "$D/$EXE" is the running LaunchDaemon, and `curl -o` truncates and rewrites it
+# under the running process. A rename swaps only the directory entry, so the
+# running process keeps its own inode and the new binary always lands whole;
+# the in-place form can leave a truncated or unchanged file depending on what
+# the kernel allows at that moment.
+#
+# Prompted by a report (2026-09-13) that re-running the installer over an
+# existing install "appeared to do nothing" -- the operator had to restore a
+# snapshot to get the new build. Be clear about the evidence: that failure was
+# NOT reproduced here (an in-place write over the running daemon succeeded on
+# the machine tested), so this is hardening against the plausible cause rather
+# than a confirmed fix. The real protection is the report printed below, which
+# now states outright whether the binary changed.
+if ! curl -fsSL "$BIN_URL" -o "$D/$EXE.new"; then
+    rm -f "$D/$EXE.new"; echo "ERROR: could not download $BIN_URL"; exit 1
+fi
+chmod 755 "$D/$EXE.new"; chown root:wheel "$D/$EXE.new"
+NEW_SUM="$(/usr/bin/shasum -a 256 "$D/$EXE.new" 2>/dev/null | cut -c1-8)"
+if ! mv -f "$D/$EXE.new" "$D/$EXE"; then
+    rm -f "$D/$EXE.new"
+    echo "ERROR: could not replace $D/$EXE -- aborting rather than leaving a stale agent."
+    exit 1
+fi
+if [ "$NEW_SUM" != "$(/usr/bin/shasum -a 256 "$D/$EXE" 2>/dev/null | cut -c1-8)" ]; then
+    echo "ERROR: $D/$EXE is not the binary just downloaded -- aborting."
+    exit 1
+fi
+if [ -z "$PREV_SUM" ]; then
+    echo "  agent installed       (build $NEW_SUM)"
+elif [ "$PREV_SUM" = "$NEW_SUM" ]; then
+    echo "  agent already current (build $NEW_SUM) -- nothing to update"
+else
+    echo "  agent UPDATED         $PREV_SUM -> $NEW_SUM"
+fi
 
 # ---- build the .msh (group binding) ----
 cat > "$D/$EXE.msh" <<MSH
@@ -333,7 +373,15 @@ echo "MeshAgent installed for group '$MESH_NAME' ($(uname -m))."
 # should be delivering these grants instead).
 # MESH_NO_FDA=1 skips only the optional Full Disk Access step.
 if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ "$CUSER" != "root" ]; then
-    if [ -e /dev/tty ]; then
+    # Test that /dev/tty can actually be OPENED, not merely that it exists. Under
+    # `curl ... | sudo bash` with no controlling terminal the node exists but every
+    # redirection to it fails, which produced five "Device not configured" errors
+    # and a misleading "walkthrough exited early" before this check was tightened.
+    # NOTE the redirection ORDER: 2>/dev/null must come FIRST. Bash applies
+    # redirections left to right, so `: >/dev/tty 2>/dev/null` attempts the
+    # /dev/tty open while stderr is still the real stderr, and prints the very
+    # "Device not configured" line this test exists to avoid.
+    if : 2>/dev/null >/dev/tty; then
         # Apple's OWN Screen Sharing helper needs consent too, separately from
         # anything meshagent asks for. Login-window input is driven through
         # screensharingd, and the first time that happens macOS asks the operator
@@ -374,8 +422,11 @@ if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ 
         sleep 1
         /bin/launchctl bootstrap "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
     else
-        echo "  (no terminal: skipping the permission walkthrough --"
-        echo "   grant Screen Recording and Accessibility in System Settings)"
+        echo
+        echo "  Permission walkthrough SKIPPED: no usable terminal."
+        echo "  That is normal for 'curl ... | sudo bash', which leaves the script"
+        echo "  without one. To be prompted for the permissions, download first:"
+        echo "      curl -fsSL $BASE_URL/install.sh -o install.sh && sudo bash install.sh"
     fi
 fi
 
@@ -420,8 +471,8 @@ echo "     (this is what grants com.apple.screensharing.agent the ScreenCapture"
 echo "      + PostEvent TCC rights that make login-window input work at all;"
 echo "      enabling the service from the command line does NOT create them)"
 echo
-echo "  Screen Recording and Accessibility were requested above by the permission"
-echo "  walkthrough. If you skipped a step there, grant it in"
+echo "  Screen Recording and Accessibility: if the walkthrough above did not run,"
+echo "  or you skipped a step in it, grant them in"
 echo "  System Settings > Privacy & Security, then run:"
 echo "      sudo launchctl bootout gui/\$(id -u) /Library/LaunchAgents/$SV.plist"
 echo "      sudo launchctl bootstrap gui/\$(id -u) /Library/LaunchAgents/$SV.plist"
