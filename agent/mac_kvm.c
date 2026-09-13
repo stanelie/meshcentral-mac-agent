@@ -417,12 +417,12 @@ int kvm_init()
 		// even when auth_value=2 is already in TCC.db; CGDisplayCreateImage works
 		// via the path-based TCC entry without needing the request call.
 		bool pre = CGPreflightScreenCaptureAccess();
-		kvm_flog("kvm_init: CGMainDisplayID=%u preflight=%d uid=%d\n",
+		kvm_flog("kvm_init: display id=%u preflight=%d uid=%d\n",
 			SCREEN_NUM, (int)pre, (int)getuid());
 	}
 	else
 	{
-		kvm_flog("kvm_init: CGMainDisplayID=%u uid=%d\n", SCREEN_NUM, (int)getuid());
+		kvm_flog("kvm_init: display id=%u uid=%d\n", SCREEN_NUM, (int)getuid());
 	}
 	
 	if (SCREEN_WIDTH > 0)
@@ -942,7 +942,7 @@ void* kvm_server_mainloop(void* param)
 
 		screen_num = kvm_selected_display();
 		static int logged_once = 0;
-		if (!logged_once) { kvm_flog("MainLoop start: CGMainDisplayID=%u\n", screen_num); logged_once = 1; }
+		if (!logged_once) { kvm_flog("MainLoop start: display id=%u\n", screen_num); logged_once = 1; }
 
 		if (screen_num == 0) { kvm_flog("CGMainDisplayID=0, shutdown\n"); g_shutdown = 1; senddebug(-2); break; }
 
