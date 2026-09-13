@@ -243,6 +243,45 @@ void kvm_refresh_display_list(void)
 	if (SCREEN_SEL > SCREEN_COUNT) SCREEN_SEL = 0;
 }
 
+// Backing scale of a display, from the display itself.
+//
+// This used to be derived as pixelWidth / SCREEN_WIDTH, i.e. from the width of
+// whatever was captured LAST. That is only valid while the display never
+// changes, and it broke the moment display switching existed: going from a
+// larger screen to a smaller one made it integer-divide to zero.
+//
+// Measured on the test VM going from display 2 back to display 1:
+//     2264 / 3136 = 0   ->  SCREEN_SCALE=0
+//     SCREEN_WIDTH  = CGDisplayPixelsWide * 0 = 0
+//     SCREEN_HEIGHT = 0, TILE_WIDTH_COUNT = 0, TILE_HEIGHT_COUNT = 0
+// so the agent captured and sent nothing at all. The viewer kept displaying the
+// last good frame -- the previous monitor -- and its display buttons stopped
+// responding because no further frames or resolution updates ever arrived. The
+// reverse direction (small to large) happened to give 2 and looked fine, which
+// is why switching one way worked.
+//
+// The ratio of the mode's pixel width to its point width is the actual scale
+// factor and depends on nothing but the display being asked about.
+static int kvm_display_scale(CGDirectDisplayID d)
+{
+	static CGDirectDisplayID cached_id = 0;
+	static int cached_scale = 1;
+	if (d == cached_id && cached_scale > 0) return cached_scale;
+
+	int scale = 1;
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(d);
+	if (mode != NULL)
+	{
+		size_t pw  = CGDisplayModeGetPixelWidth(mode);
+		size_t ptw = CGDisplayModeGetWidth(mode);
+		if (ptw > 0 && pw >= ptw) scale = (int)(pw / ptw);
+		CGDisplayModeRelease(mode);
+	}
+	if (scale < 1) scale = 1;
+	cached_id = d; cached_scale = scale;
+	return scale;
+}
+
 CGDirectDisplayID kvm_selected_display(void)
 {
 	if (SCREEN_SEL >= 1 && SCREEN_SEL <= SCREEN_COUNT) return SCREEN_LIST[SCREEN_SEL - 1];
@@ -456,12 +495,7 @@ int kvm_init()
 		kvm_flog("kvm_init: display id=%u uid=%d\n", SCREEN_NUM, (int)getuid());
 	}
 	
-	if (SCREEN_WIDTH > 0)
-	{
-		CGDisplayModeRef mode = CGDisplayCopyDisplayMode(SCREEN_NUM);
-		SCREEN_SCALE = (int) CGDisplayModeGetPixelWidth(mode) / SCREEN_WIDTH;
-		CGDisplayModeRelease(mode);
-	}
+	SCREEN_SCALE = kvm_display_scale(SCREEN_NUM);
 
 	kvm_flog("kvm_init: CGDisplayIsActive=%d CGDisplayIsOnline=%d\n",
 		(int)CGDisplayIsActive(SCREEN_NUM), (int)CGDisplayIsOnline(SCREEN_NUM));
@@ -983,19 +1017,14 @@ void* kvm_server_mainloop(void* param)
 
 		if (screen_num == 0) { kvm_flog("CGMainDisplayID=0, shutdown\n"); g_shutdown = 1; senddebug(-2); break; }
 
-		if (SCREEN_SCALE_SET == 0)
+		// Size the frame from the display we are actually on. The old code only
+		// ever revised SCREEN_SCALE upward and then latched it (SCREEN_SCALE_SET),
+		// which cannot survive switching to a display with a different scale.
 		{
-			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
-			if (SCREEN_WIDTH > 0 && SCREEN_SCALE < (int) CGDisplayModeGetPixelWidth(mode) / SCREEN_WIDTH)
-			{
-				SCREEN_SCALE = (int) CGDisplayModeGetPixelWidth(mode) / SCREEN_WIDTH;
-				SCREEN_SCALE_SET = 1;
-			}			 
-			CGDisplayModeRelease(mode);
+			int sc = kvm_display_scale(screen_num);
+			screen_height = (int)CGDisplayPixelsHigh(screen_num) * sc;
+			screen_width  = (int)CGDisplayPixelsWide(screen_num) * sc;
 		}
-		
-		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
-		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
 		
 		if ((SCREEN_HEIGHT != screen_height || (SCREEN_WIDTH != screen_width) || SCREEN_NUM != screen_num))
 		{
