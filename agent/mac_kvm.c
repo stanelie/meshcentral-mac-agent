@@ -206,6 +206,37 @@ void kvm_refresh_display_list(void)
 		if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay) continue;
 		SCREEN_LIST[SCREEN_COUNT++] = ids[i];
 	}
+
+	// Order deterministically: main display first, then left-to-right, top-to-bottom.
+	//
+	// CGGetActiveDisplayList does NOT promise a stable order, and this list is
+	// rebuilt on every SET_DISPLAY and every advertisement. An unstable order
+	// silently remaps what "Display 1" means between the moment the viewer is told
+	// the list and the moment it asks to switch -- so picking a display could hand
+	// back a different one, which is exactly the shape of "switching back to the
+	// first monitor keeps showing the second". Sorting makes index N always mean
+	// the same physical screen for as long as the layout is unchanged.
+	for (int i = 1; i < SCREEN_COUNT; i++)
+	{
+		CGDirectDisplayID key = SCREEN_LIST[i];
+		CGRect kb = CGDisplayBounds(key);
+		int kmain = CGDisplayIsMain(key) ? 1 : 0;
+		int j = i - 1;
+		while (j >= 0)
+		{
+			CGDirectDisplayID cur = SCREEN_LIST[j];
+			CGRect cb = CGDisplayBounds(cur);
+			int cmain = CGDisplayIsMain(cur) ? 1 : 0;
+			int after = 0;                        // does cur sort AFTER key?
+			if (cmain != kmain)            after = (kmain > cmain);
+			else if (cb.origin.x != kb.origin.x) after = (cb.origin.x > kb.origin.x);
+			else                            after = (cb.origin.y > kb.origin.y);
+			if (!after) break;
+			SCREEN_LIST[j + 1] = cur;
+			j--;
+		}
+		SCREEN_LIST[j + 1] = key;
+	}
 	if (SCREEN_COUNT == 0) { SCREEN_LIST[0] = CGMainDisplayID(); SCREEN_COUNT = 1; }
 	// A display can be unplugged mid-session; fall back to the main one rather
 	// than capturing an ID that no longer exists.
@@ -595,8 +626,14 @@ int kvm_server_inputdata(char* block, int blocklen)
 			// that option (no composite capture yet), but a viewer can still ask
 			// for it -- fall back to the first display rather than blanking.
 			int newsel = (v == 65535) ? 1 : (int)v;
-			if (newsel < 1 || newsel > SCREEN_COUNT) break;
-			if (newsel == SCREEN_SEL) break;
+			// Log the RAW request unconditionally, before any early return. Every
+			// rejection path below used to be silent, which meant a switch that did
+			// nothing left no trace at all and could not be told apart from a switch
+			// that was never sent.
+			kvm_flog("MNG_KVM_SET_DISPLAY: raw=%u -> want=%d (have %d, current %d)\n",
+				(unsigned)v, newsel, SCREEN_COUNT, SCREEN_SEL);
+			if (newsel < 1 || newsel > SCREEN_COUNT) { kvm_flog("  ignored: out of range\n"); break; }
+			if (newsel == SCREEN_SEL) { kvm_flog("  ignored: already selected\n"); break; }
 			SCREEN_SEL = newsel;
 			kvm_flog("MNG_KVM_SET_DISPLAY: -> %d/%d (id=%u)\n",
 				SCREEN_SEL, SCREEN_COUNT, kvm_selected_display());

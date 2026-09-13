@@ -1979,7 +1979,7 @@ index d6bb534..94eb8b0 100644
  #endif /* LINUX_EVENTS_H_ */
 +void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..41543b3 100644
+index 6d57690..527b346 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -2044,7 +2044,7 @@ index 6d57690..41543b3 100644
  int SH_HANDLE = 0;
  int SCREEN_WIDTH = 0;
  int SCREEN_HEIGHT = 0;
-@@ -151,6 +189,78 @@ void kvm_send_resolution()
+@@ -151,6 +189,109 @@ void kvm_send_resolution()
  	ILibQueue_UnLock(g_messageQ);
  }
  
@@ -2064,6 +2064,37 @@ index 6d57690..41543b3 100644
 +	{
 +		if (CGDisplayMirrorsDisplay(ids[i]) != kCGNullDirectDisplay) continue;
 +		SCREEN_LIST[SCREEN_COUNT++] = ids[i];
++	}
++
++	// Order deterministically: main display first, then left-to-right, top-to-bottom.
++	//
++	// CGGetActiveDisplayList does NOT promise a stable order, and this list is
++	// rebuilt on every SET_DISPLAY and every advertisement. An unstable order
++	// silently remaps what "Display 1" means between the moment the viewer is told
++	// the list and the moment it asks to switch -- so picking a display could hand
++	// back a different one, which is exactly the shape of "switching back to the
++	// first monitor keeps showing the second". Sorting makes index N always mean
++	// the same physical screen for as long as the layout is unchanged.
++	for (int i = 1; i < SCREEN_COUNT; i++)
++	{
++		CGDirectDisplayID key = SCREEN_LIST[i];
++		CGRect kb = CGDisplayBounds(key);
++		int kmain = CGDisplayIsMain(key) ? 1 : 0;
++		int j = i - 1;
++		while (j >= 0)
++		{
++			CGDirectDisplayID cur = SCREEN_LIST[j];
++			CGRect cb = CGDisplayBounds(cur);
++			int cmain = CGDisplayIsMain(cur) ? 1 : 0;
++			int after = 0;                        // does cur sort AFTER key?
++			if (cmain != kmain)            after = (kmain > cmain);
++			else if (cb.origin.x != kb.origin.x) after = (cb.origin.x > kb.origin.x);
++			else                            after = (cb.origin.y > kb.origin.y);
++			if (!after) break;
++			SCREEN_LIST[j + 1] = cur;
++			j--;
++		}
++		SCREEN_LIST[j + 1] = key;
 +	}
 +	if (SCREEN_COUNT == 0) { SCREEN_LIST[0] = CGMainDisplayID(); SCREEN_COUNT = 1; }
 +	// A display can be unplugged mid-session; fall back to the main one rather
@@ -2123,7 +2154,7 @@ index 6d57690..41543b3 100644
  #define BUFSIZE 65535
  
  int set_kbd_state(int input_state)
-@@ -289,8 +399,31 @@ int kvm_init()
+@@ -289,8 +430,31 @@ int kvm_init()
  {
  	ILibCriticalLogFilename = "KVMSlave.log";
  	int old_height_count = TILE_HEIGHT_COUNT;
@@ -2157,7 +2188,7 @@ index 6d57690..41543b3 100644
  	
  	if (SCREEN_WIDTH > 0)
  	{
-@@ -299,8 +432,23 @@ int kvm_init()
+@@ -299,8 +463,23 @@ int kvm_init()
  		CGDisplayModeRelease(mode);
  	}
  
@@ -2181,7 +2212,7 @@ index 6d57690..41543b3 100644
  	// Some magic numbers.
  	TILE_WIDTH = 32;
  	TILE_HEIGHT = 32;
-@@ -312,13 +460,24 @@ int kvm_init()
+@@ -312,13 +491,24 @@ int kvm_init()
  	if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
  	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
  	
@@ -2208,7 +2239,7 @@ index 6d57690..41543b3 100644
  
  	// Write the reply to the pipe.
  	ILibQueue_Lock(g_messageQ);
-@@ -341,6 +500,12 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -341,6 +531,12 @@ int kvm_server_inputdata(char* block, int blocklen)
  	type = ntohs(((unsigned short*)(block))[0]);
  	size = ntohs(((unsigned short*)(block))[1]);
  
@@ -2221,7 +2252,7 @@ index 6d57690..41543b3 100644
  	if (size > blocklen) return 0;
  
  	switch (type)
-@@ -416,6 +581,30 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -416,6 +612,36 @@ int kvm_server_inputdata(char* block, int blocklen)
  			//if (fr > 20 && fr < 2000) FRAME_RATE_TIMER = fr;
  			break;
  		}
@@ -2239,8 +2270,14 @@ index 6d57690..41543b3 100644
 +			// that option (no composite capture yet), but a viewer can still ask
 +			// for it -- fall back to the first display rather than blanking.
 +			int newsel = (v == 65535) ? 1 : (int)v;
-+			if (newsel < 1 || newsel > SCREEN_COUNT) break;
-+			if (newsel == SCREEN_SEL) break;
++			// Log the RAW request unconditionally, before any early return. Every
++			// rejection path below used to be silent, which meant a switch that did
++			// nothing left no trace at all and could not be told apart from a switch
++			// that was never sent.
++			kvm_flog("MNG_KVM_SET_DISPLAY: raw=%u -> want=%d (have %d, current %d)\n",
++				(unsigned)v, newsel, SCREEN_COUNT, SCREEN_SEL);
++			if (newsel < 1 || newsel > SCREEN_COUNT) { kvm_flog("  ignored: out of range\n"); break; }
++			if (newsel == SCREEN_SEL) { kvm_flog("  ignored: already selected\n"); break; }
 +			SCREEN_SEL = newsel;
 +			kvm_flog("MNG_KVM_SET_DISPLAY: -> %d/%d (id=%u)\n",
 +				SCREEN_SEL, SCREEN_COUNT, kvm_selected_display());
@@ -2252,7 +2289,7 @@ index 6d57690..41543b3 100644
  	}
  
  	return size;
-@@ -484,7 +673,7 @@ void* kvm_mainloopinput(void* param)
+@@ -484,7 +710,7 @@ void* kvm_mainloopinput(void* param)
  	int ptr = 0;
  	int ptr2 = 0;
  	int len = 0;
@@ -2261,7 +2298,7 @@ index 6d57690..41543b3 100644
  	int cbBytesRead = 0;
  
  	char tmp[255];
-@@ -507,6 +696,35 @@ void* kvm_mainloopinput(void* param)
+@@ -507,6 +733,35 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		KvmDebugLog("Reading from master in kvm_mainloopinput\n");
@@ -2297,7 +2334,7 @@ index 6d57690..41543b3 100644
  		cbBytesRead = read(KVM_AGENT_FD == -1 ? STDIN_FILENO: KVM_AGENT_FD, pchRequest2 + len, 30000 - len);
  		KvmDebugLog("Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
  
-@@ -539,7 +757,7 @@ void* kvm_mainloopinput(void* param)
+@@ -539,7 +794,7 @@ void* kvm_mainloopinput(void* param)
  			write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
  		}
@@ -2306,7 +2343,7 @@ index 6d57690..41543b3 100644
  
  		if (KVM_AGENT_FD != -1)
  		{
-@@ -549,7 +767,7 @@ void* kvm_mainloopinput(void* param)
+@@ -549,7 +804,7 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		if (ptr == len) { len = 0; ptr = 0; }
@@ -2315,7 +2352,7 @@ index 6d57690..41543b3 100644
  	}
  
  	return 0;
-@@ -557,16 +775,11 @@ void* kvm_mainloopinput(void* param)
+@@ -557,16 +812,11 @@ void* kvm_mainloopinput(void* param)
  void ExitSink(int s)
  {
  	UNREFERENCED_PARAMETER(s);
@@ -2337,7 +2374,7 @@ index 6d57690..41543b3 100644
  }
  void* kvm_server_mainloop(void* param)
  {
-@@ -637,6 +850,7 @@ void* kvm_server_mainloop(void* param)
+@@ -637,6 +887,7 @@ void* kvm_server_mainloop(void* param)
  		{
  			written = write(STDOUT_FILENO, "ACCEPT ERROR ON DOMAIN SOCKET", 29);
  			fsync(STDOUT_FILENO);
@@ -2345,7 +2382,7 @@ index 6d57690..41543b3 100644
  			return(NULL);
  		}
  		else
-@@ -645,12 +859,15 @@ void* kvm_server_mainloop(void* param)
+@@ -645,12 +896,15 @@ void* kvm_server_mainloop(void* param)
  			int tmpLen = sprintf_s(tmp, sizeof(tmp), "ACCEPTed new connection %d on Domain Socket\n", KVM_AGENT_FD);
  			written = write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
@@ -2363,7 +2400,7 @@ index 6d57690..41543b3 100644
  
  
  	g_shutdown = 0;
-@@ -723,10 +940,12 @@ void* kvm_server_mainloop(void* param)
+@@ -723,10 +977,12 @@ void* kvm_server_mainloop(void* param)
  			}
  		}
  
@@ -2379,7 +2416,7 @@ index 6d57690..41543b3 100644
  		if (SCREEN_SCALE_SET == 0)
  		{
  			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
-@@ -741,19 +960,143 @@ void* kvm_server_mainloop(void* param)
+@@ -741,19 +997,143 @@ void* kvm_server_mainloop(void* param)
  		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
  		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
  		
@@ -2400,7 +2437,9 @@ index 6d57690..41543b3 100644
 +		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 +		CGImageRef image = NULL;
 +		if (getuid() == 0)
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
 +			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
 +			// back to the standard CoreGraphics capture APIs: on a PHYSICAL Mac (not
@@ -2517,9 +2556,7 @@ index 6d57690..41543b3 100644
 +			image = kvm_capture_sck((uint32_t)screen_num);
 +		}
 +		if (image == NULL)
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// All capture APIs failed. Sleep 1s and retry rather than exiting —
 +			// launchd won't restart on exit(0), and SCK needs time to settle.
 +			static int all_logged = 0;
@@ -2529,7 +2566,7 @@ index 6d57690..41543b3 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1331,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1368,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -2555,7 +2592,7 @@ index 6d57690..41543b3 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1412,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1449,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -2617,7 +2654,7 @@ index 6d57690..41543b3 100644
  	}
  }
  
-@@ -1150,6 +1537,402 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,6 +1574,402 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -3020,7 +3057,7 @@ index 6d57690..41543b3 100644
  void kvm_check_permission()
  {
  
-@@ -1190,4 +1973,60 @@ void kvm_check_permission()
+@@ -1190,4 +2010,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }
