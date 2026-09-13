@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..b6d96b5 100644
+index b70a508..be4c7ec 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -24,7 +24,7 @@ index b70a508..b6d96b5 100644
  #endif
  
  
-@@ -102,6 +103,17 @@ int main(int argc, char **argv)
+@@ -102,6 +103,32 @@ int main(int argc, char **argv)
  	int retCode = 0;
  	int capabilities = 0;
  
@@ -37,12 +37,27 @@ index b70a508..b6d96b5 100644
 +		if (_ef) { fprintf(_ef, "main() argc=%d argv[1]=%s uid=%d pid=%d\n", argc, _arg1, (int)getuid(), (int)getpid()); fclose(_ef); }
 +		fprintf(stderr, "main() argc=%d argv[1]=%s uid=%d pid=%d\n", argc, _arg1, (int)getuid(), (int)getpid());
 +	}
++	// Keep the kvmagent copy in step with this binary.
++	//
++	// Called from here rather than from kvm_check_permission(), which looked like
++	// the natural macOS startup hook but is DEAD CODE on this platform: its only
++	// call site in agentcore.c is guarded by #if defined(_LINKVM), and the
++	// makefile's macos target never defines _LINKVM. Verified by instrumenting
++	// the function and seeing it never run.
++	//
++	// Safe to call unconditionally: kvm_sync_agent_copy() does nothing unless it
++	// is running as root from the install directory, so the -kvmagent,
++	// -requestperms and -vncprobe paths all return immediately.
++	{
++		extern void kvm_sync_agent_copy(void);
++		kvm_sync_agent_copy();
++	}
 +#endif
 +
  #ifdef WIN32
  	int argvi, argvsz;
  	char **argv = (char**)ILibMemory_SmartAllocate(argc * sizeof(void*));
-@@ -303,6 +315,46 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -303,6 +330,46 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  		kvm_server_mainloop((void*)(uint64_t)getpid());
  		return 0;
  	}
@@ -89,7 +104,7 @@ index b70a508..b6d96b5 100644
  	else if (argc > 1 && strcasecmp(argv[1], "-kvmagent") == 0)
  	{
  		// User-context LaunchAgent mode: long-running KVM server that
-@@ -327,8 +379,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -327,8 +394,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
  			kvm_set_listener_path(defaultPath);
  		}
@@ -1979,7 +1994,7 @@ index d6bb534..94eb8b0 100644
  #endif /* LINUX_EVENTS_H_ */
 +void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..0565f64 100644
+index 6d57690..f604b4d 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -1990,7 +2005,7 @@ index 6d57690..0565f64 100644
  #include "../../meshdefines.h"
  #include "../../meshinfo.h"
  #include "../../../microstack/ILibParsers.h"
-@@ -31,9 +32,21 @@ limitations under the License.
+@@ -31,9 +32,22 @@ limitations under the License.
  #include <sys/socket.h>
  #include <sys/stat.h>
  #include <sys/un.h>
@@ -2000,6 +2015,7 @@ index 6d57690..0565f64 100644
  #include <pwd.h>
 +#include <dlfcn.h>
 +#include <mach-o/dyld.h>
++#include <SystemConfiguration/SystemConfiguration.h>
 +
 +// Temporary diagnostic log for loginwindow KVM debugging
 +static void kvm_flog(const char *fmt, ...) {
@@ -2012,7 +2028,7 @@ index 6d57690..0565f64 100644
  
  int KVM_Listener_FD = -1;
  // Socket path used when kvm_server_mainloop runs in socket-listener
-@@ -81,6 +94,31 @@ int KVM_SEND(char *buffer, int bufferLen)
+@@ -81,6 +95,31 @@ int KVM_SEND(char *buffer, int bufferLen)
  
  
  CGDirectDisplayID SCREEN_NUM = 0;
@@ -2044,7 +2060,7 @@ index 6d57690..0565f64 100644
  int SH_HANDLE = 0;
  int SCREEN_WIDTH = 0;
  int SCREEN_HEIGHT = 0;
-@@ -151,6 +189,235 @@ void kvm_send_resolution()
+@@ -151,6 +190,235 @@ void kvm_send_resolution()
  	ILibQueue_UnLock(g_messageQ);
  }
  
@@ -2280,7 +2296,7 @@ index 6d57690..0565f64 100644
  #define BUFSIZE 65535
  
  int set_kbd_state(int input_state)
-@@ -289,18 +556,60 @@ int kvm_init()
+@@ -289,18 +557,60 @@ int kvm_init()
  {
  	ILibCriticalLogFilename = "KVMSlave.log";
  	int old_height_count = TILE_HEIGHT_COUNT;
@@ -2307,7 +2323,7 @@ index 6d57690..0565f64 100644
 +		else
 +			kvm_flog("kvm_init: display %d/%d id=%u origin=(%d,%d)\n",
 +				SCREEN_SEL, SCREEN_COUNT, SCREEN_NUM, SCREEN_ORIGIN_X, SCREEN_ORIGIN_Y);
- 	}
++	}
 +	if (__builtin_available(macOS 10.15, *))
 +	{
 +		// Check (but do NOT request) TCC screen capture access.
@@ -2321,7 +2337,7 @@ index 6d57690..0565f64 100644
 +	else
 +	{
 +		kvm_flog("kvm_init: display id=%u uid=%d\n", SCREEN_NUM, (int)getuid());
-+	}
+ 	}
 +	
 +	SCREEN_SCALE = kvm_selected_scale();
  
@@ -2350,7 +2366,7 @@ index 6d57690..0565f64 100644
  	// Some magic numbers.
  	TILE_WIDTH = 32;
  	TILE_HEIGHT = 32;
-@@ -312,13 +621,24 @@ int kvm_init()
+@@ -312,13 +622,24 @@ int kvm_init()
  	if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
  	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
  	
@@ -2377,7 +2393,7 @@ index 6d57690..0565f64 100644
  
  	// Write the reply to the pipe.
  	ILibQueue_Lock(g_messageQ);
-@@ -341,6 +661,12 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -341,6 +662,12 @@ int kvm_server_inputdata(char* block, int blocklen)
  	type = ntohs(((unsigned short*)(block))[0]);
  	size = ntohs(((unsigned short*)(block))[1]);
  
@@ -2390,7 +2406,7 @@ index 6d57690..0565f64 100644
  	if (size > blocklen) return 0;
  
  	switch (type)
-@@ -416,6 +742,45 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -416,6 +743,45 @@ int kvm_server_inputdata(char* block, int blocklen)
  			//if (fr > 20 && fr < 2000) FRAME_RATE_TIMER = fr;
  			break;
  		}
@@ -2436,7 +2452,7 @@ index 6d57690..0565f64 100644
  	}
  
  	return size;
-@@ -484,7 +849,7 @@ void* kvm_mainloopinput(void* param)
+@@ -484,7 +850,7 @@ void* kvm_mainloopinput(void* param)
  	int ptr = 0;
  	int ptr2 = 0;
  	int len = 0;
@@ -2445,7 +2461,7 @@ index 6d57690..0565f64 100644
  	int cbBytesRead = 0;
  
  	char tmp[255];
-@@ -507,6 +872,35 @@ void* kvm_mainloopinput(void* param)
+@@ -507,6 +873,35 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		KvmDebugLog("Reading from master in kvm_mainloopinput\n");
@@ -2481,7 +2497,7 @@ index 6d57690..0565f64 100644
  		cbBytesRead = read(KVM_AGENT_FD == -1 ? STDIN_FILENO: KVM_AGENT_FD, pchRequest2 + len, 30000 - len);
  		KvmDebugLog("Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
  
-@@ -539,7 +933,7 @@ void* kvm_mainloopinput(void* param)
+@@ -539,7 +934,7 @@ void* kvm_mainloopinput(void* param)
  			write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
  		}
@@ -2490,7 +2506,7 @@ index 6d57690..0565f64 100644
  
  		if (KVM_AGENT_FD != -1)
  		{
-@@ -549,7 +943,7 @@ void* kvm_mainloopinput(void* param)
+@@ -549,7 +944,7 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		if (ptr == len) { len = 0; ptr = 0; }
@@ -2499,7 +2515,7 @@ index 6d57690..0565f64 100644
  	}
  
  	return 0;
-@@ -557,16 +951,11 @@ void* kvm_mainloopinput(void* param)
+@@ -557,16 +952,11 @@ void* kvm_mainloopinput(void* param)
  void ExitSink(int s)
  {
  	UNREFERENCED_PARAMETER(s);
@@ -2521,7 +2537,7 @@ index 6d57690..0565f64 100644
  }
  void* kvm_server_mainloop(void* param)
  {
-@@ -637,6 +1026,7 @@ void* kvm_server_mainloop(void* param)
+@@ -637,6 +1027,7 @@ void* kvm_server_mainloop(void* param)
  		{
  			written = write(STDOUT_FILENO, "ACCEPT ERROR ON DOMAIN SOCKET", 29);
  			fsync(STDOUT_FILENO);
@@ -2529,7 +2545,7 @@ index 6d57690..0565f64 100644
  			return(NULL);
  		}
  		else
-@@ -645,12 +1035,15 @@ void* kvm_server_mainloop(void* param)
+@@ -645,12 +1036,15 @@ void* kvm_server_mainloop(void* param)
  			int tmpLen = sprintf_s(tmp, sizeof(tmp), "ACCEPTed new connection %d on Domain Socket\n", KVM_AGENT_FD);
  			written = write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
@@ -2547,7 +2563,7 @@ index 6d57690..0565f64 100644
  
  
  	g_shutdown = 0;
-@@ -723,37 +1116,165 @@ void* kvm_server_mainloop(void* param)
+@@ -723,37 +1117,165 @@ void* kvm_server_mainloop(void* param)
  			}
  		}
  
@@ -2627,9 +2643,7 @@ index 6d57690..0565f64 100644
 +			}
 +		}
 +		else
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
 +			// display directly instead of compositing the window list, and measured
 +			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
@@ -2723,7 +2737,9 @@ index 6d57690..0565f64 100644
 +			image = kvm_capture_sck((uint32_t)screen_num);
 +		}
 +		if (image == NULL)
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// All capture APIs failed. Sleep 1s and retry rather than exiting —
 +			// launchd won't restart on exit(0), and SCK needs time to settle.
 +			static int all_logged = 0;
@@ -2733,7 +2749,7 @@ index 6d57690..0565f64 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1509,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1510,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -2759,7 +2775,7 @@ index 6d57690..0565f64 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1590,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1591,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -2821,7 +2837,7 @@ index 6d57690..0565f64 100644
  	}
  }
  
-@@ -1150,6 +1715,402 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,8 +1716,512 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -3221,10 +3237,120 @@ index 6d57690..0565f64 100644
 +    printf("  Full Disk Access: optional -- confirm in System Settings if you use file transfer\n\n");
 +}
 +
++// Are two files byte-identical? Used to decide whether a refresh is needed at
++// all, so the common case (already in step) costs one read and no writes.
++static int kvm_files_identical(const char *a, const char *b)
++{
++	struct stat sa, sb;
++	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return 0;
++	if (sa.st_size != sb.st_size) return 0;
++	FILE *fa = fopen(a, "rb"); if (!fa) return 0;
++	FILE *fb = fopen(b, "rb"); if (!fb) { fclose(fa); return 0; }
++	char ba[65536], bb[65536];
++	int same = 1;
++	for (;;)
++	{
++		size_t ra = fread(ba, 1, sizeof(ba), fa);
++		size_t rb = fread(bb, 1, sizeof(bb), fb);
++		if (ra != rb || memcmp(ba, bb, ra) != 0) { same = 0; break; }
++		if (ra == 0) break;
++	}
++	fclose(fa); fclose(fb);
++	return same;
++}
++
++// Keep <dir>/kvm/<exe> in step with the daemon binary.
++//
++// MeshCentral updates the DAEMON on its own -- that is what the console's
++// "force agent update" drives -- but every bit of KVM work runs in a LaunchAgent
++// executing a COPY at <dir>/kvm/<exe>, and until now nothing except the
++// installer ever wrote that copy. Observed on a deployed Mac: minutes after a
++// server-side deploy the daemon had replaced itself while kvm/<exe> sat on the
++// previous build indefinitely. So a fleet silently ran new daemons against old
++// KVM agents, and every KVM fix landed only when someone re-ran the installer by
++// hand on each machine. "Force agent update" could not fix it because it does
++// not know that second file exists.
++//
++// Runs from the daemon at startup, so it happens right after any self-update.
++void kvm_sync_agent_copy(void)
++{
++	if (getuid() != 0) return;            // only the root daemon owns that file
++
++	char exe[PATH_MAX]; uint32_t sz = (uint32_t)sizeof(exe);
++	if (_NSGetExecutablePath(exe, &sz) != 0) return;
++	char self[PATH_MAX];
++	if (realpath(exe, self) == NULL) return;
++
++	char dir[PATH_MAX];
++	snprintf(dir, sizeof(dir), "%s", self);
++	char *base = strrchr(dir, '/');
++	if (base == NULL) return;
++	*base++ = 0;                          // dir = directory, base = file name
++
++	// If we ARE the copy, stop: the kvmagent must never rewrite itself.
++	const char *dname = strrchr(dir, '/');
++	if (dname != NULL && strcmp(dname + 1, "kvm") == 0) return;
++
++	char dst[PATH_MAX], tmp[PATH_MAX];
++	snprintf(dst, sizeof(dst), "%s/kvm/%s", dir, base);
++	struct stat st;
++	if (stat(dst, &st) != 0) { kvm_flog("kvm_sync: no %s\n", dst); return; }
++	if (kvm_files_identical(self, dst)) { kvm_flog("kvm_sync: %s already in step\n", dst); return; }
++	kvm_flog("kvm_sync: %s differs -- refreshing\n", dst);
++
++	snprintf(tmp, sizeof(tmp), "%s.new", dst);
++	// The copy can be pinned immutable (chflags uchg); clear that or the write
++	// fails with EPERM even as root.
++	chflags(dst, 0);
++	unlink(tmp);
++
++	FILE *in = fopen(self, "rb"); if (!in) return;
++	FILE *out = fopen(tmp, "wb"); if (!out) { fclose(in); return; }
++	char buf[65536]; size_t r; int ok = 1;
++	while ((r = fread(buf, 1, sizeof(buf), in)) > 0)
++		if (fwrite(buf, 1, r, out) != r) { ok = 0; break; }
++	fclose(in);
++	if (fclose(out) != 0) ok = 0;
++	if (!ok) { unlink(tmp); kvm_flog("kvm_sync: copy failed\n"); return; }
++
++	chmod(tmp, 0755);
++	if (chown(tmp, 0, 0) != 0) { /* best effort */ }
++	// Rename rather than overwrite: the kvmagent may be executing the old file,
++	// and a rename swaps only the directory entry, leaving its inode intact.
++	if (rename(tmp, dst) != 0) { unlink(tmp); kvm_flog("kvm_sync: rename failed\n"); return; }
++	kvm_flog("kvm_sync: refreshed %s from the daemon binary\n", dst);
++
++	// Restart the console user's LaunchAgent so the new binary takes effect now
++	// rather than at the next login. kickstart -k also bypasses ThrottleInterval.
++	uid_t cuid = 0;
++	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("meshagent-sync"), NULL, NULL);
++	if (store != NULL)
++	{
++		CFStringRef name = SCDynamicStoreCopyConsoleUser(store, &cuid, NULL);
++		if (name != NULL) CFRelease(name); else cuid = 0;
++		CFRelease(store);
++	}
++	if (cuid > 0)
++	{
++		char cmd[192];
++		snprintf(cmd, sizeof(cmd),
++			"/bin/launchctl kickstart -k gui/%u/meshagent-launchagent >/dev/null 2>&1",
++			(unsigned)cuid);
++		(void)system(cmd);
++		kvm_flog("kvm_sync: restarted the kvmagent for uid %u\n", (unsigned)cuid);
++	}
++}
++
  void kvm_check_permission()
  {
++	// Do this first: a daemon that has just self-updated should bring its KVM
++	// copy along before anything else looks at permissions or capture.
++	kvm_sync_agent_copy();
++
  
-@@ -1190,4 +2151,60 @@ void kvm_check_permission()
+     //Request screen recording access
+     if(__builtin_available(macOS 10.15, *)){
+@@ -1190,4 +2260,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

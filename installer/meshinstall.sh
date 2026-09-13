@@ -373,10 +373,15 @@ echo "MeshAgent installed for group '$MESH_NAME' ($(uname -m))."
 # should be delivering these grants instead).
 # MESH_NO_FDA=1 skips only the optional Full Disk Access step.
 if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ "$CUSER" != "root" ]; then
-    # Test that /dev/tty can actually be OPENED, not merely that it exists. Under
-    # `curl ... | sudo bash` with no controlling terminal the node exists but every
-    # redirection to it fails, which produced five "Device not configured" errors
-    # and a misleading "walkthrough exited early" before this check was tightened.
+    # Test that /dev/tty can actually be OPENED, not merely that it exists.
+    #
+    # `curl ... | sudo bash` typed at a Terminal is FINE -- the pipe is only
+    # stdin, and the controlling terminal is still there, which is why the
+    # walkthrough prompts normally that way (confirmed by an operator installing
+    # from a clean snapshot). What has no usable terminal is a non-interactive
+    # run: MDM, a remote command, a CI job, a script under nohup. There the node
+    # still exists but every redirection to it fails, which produced five
+    # "Device not configured" errors and a misleading "walkthrough exited early".
     # NOTE the redirection ORDER: 2>/dev/null must come FIRST. Bash applies
     # redirections left to right, so `: >/dev/tty 2>/dev/null` attempts the
     # /dev/tty open while stderr is still the real stderr, and prints the very
@@ -423,10 +428,11 @@ if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ 
         /bin/launchctl bootstrap "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
     else
         echo
-        echo "  Permission walkthrough SKIPPED: no usable terminal."
-        echo "  That is normal for 'curl ... | sudo bash', which leaves the script"
-        echo "  without one. To be prompted for the permissions, download first:"
-        echo "      curl -fsSL $BASE_URL/install.sh -o install.sh && sudo bash install.sh"
+        echo "  Permission walkthrough SKIPPED: no usable terminal to ask on."
+        echo "  (Expected for MDM or any non-interactive run. Installing by hand from"
+        echo "   a Terminal, including 'curl ... | sudo bash', does prompt normally.)"
+        echo "  Grant Screen Recording and Accessibility in System Settings, or run"
+        echo "  this again from a Terminal to be walked through them."
     fi
 fi
 

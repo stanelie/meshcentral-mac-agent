@@ -38,6 +38,7 @@ limitations under the License.
 #include <pwd.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 
 // Temporary diagnostic log for loginwindow KVM debugging
 static void kvm_flog(const char *fmt, ...) {
@@ -2111,8 +2112,116 @@ void kvm_request_permissions_interactive(int wantFDA)
     printf("  Full Disk Access: optional -- confirm in System Settings if you use file transfer\n\n");
 }
 
+// Are two files byte-identical? Used to decide whether a refresh is needed at
+// all, so the common case (already in step) costs one read and no writes.
+static int kvm_files_identical(const char *a, const char *b)
+{
+	struct stat sa, sb;
+	if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return 0;
+	if (sa.st_size != sb.st_size) return 0;
+	FILE *fa = fopen(a, "rb"); if (!fa) return 0;
+	FILE *fb = fopen(b, "rb"); if (!fb) { fclose(fa); return 0; }
+	char ba[65536], bb[65536];
+	int same = 1;
+	for (;;)
+	{
+		size_t ra = fread(ba, 1, sizeof(ba), fa);
+		size_t rb = fread(bb, 1, sizeof(bb), fb);
+		if (ra != rb || memcmp(ba, bb, ra) != 0) { same = 0; break; }
+		if (ra == 0) break;
+	}
+	fclose(fa); fclose(fb);
+	return same;
+}
+
+// Keep <dir>/kvm/<exe> in step with the daemon binary.
+//
+// MeshCentral updates the DAEMON on its own -- that is what the console's
+// "force agent update" drives -- but every bit of KVM work runs in a LaunchAgent
+// executing a COPY at <dir>/kvm/<exe>, and until now nothing except the
+// installer ever wrote that copy. Observed on a deployed Mac: minutes after a
+// server-side deploy the daemon had replaced itself while kvm/<exe> sat on the
+// previous build indefinitely. So a fleet silently ran new daemons against old
+// KVM agents, and every KVM fix landed only when someone re-ran the installer by
+// hand on each machine. "Force agent update" could not fix it because it does
+// not know that second file exists.
+//
+// Runs from the daemon at startup, so it happens right after any self-update.
+void kvm_sync_agent_copy(void)
+{
+	if (getuid() != 0) return;            // only the root daemon owns that file
+
+	char exe[PATH_MAX]; uint32_t sz = (uint32_t)sizeof(exe);
+	if (_NSGetExecutablePath(exe, &sz) != 0) return;
+	char self[PATH_MAX];
+	if (realpath(exe, self) == NULL) return;
+
+	char dir[PATH_MAX];
+	snprintf(dir, sizeof(dir), "%s", self);
+	char *base = strrchr(dir, '/');
+	if (base == NULL) return;
+	*base++ = 0;                          // dir = directory, base = file name
+
+	// If we ARE the copy, stop: the kvmagent must never rewrite itself.
+	const char *dname = strrchr(dir, '/');
+	if (dname != NULL && strcmp(dname + 1, "kvm") == 0) return;
+
+	char dst[PATH_MAX], tmp[PATH_MAX];
+	snprintf(dst, sizeof(dst), "%s/kvm/%s", dir, base);
+	struct stat st;
+	if (stat(dst, &st) != 0) { kvm_flog("kvm_sync: no %s\n", dst); return; }
+	if (kvm_files_identical(self, dst)) { kvm_flog("kvm_sync: %s already in step\n", dst); return; }
+	kvm_flog("kvm_sync: %s differs -- refreshing\n", dst);
+
+	snprintf(tmp, sizeof(tmp), "%s.new", dst);
+	// The copy can be pinned immutable (chflags uchg); clear that or the write
+	// fails with EPERM even as root.
+	chflags(dst, 0);
+	unlink(tmp);
+
+	FILE *in = fopen(self, "rb"); if (!in) return;
+	FILE *out = fopen(tmp, "wb"); if (!out) { fclose(in); return; }
+	char buf[65536]; size_t r; int ok = 1;
+	while ((r = fread(buf, 1, sizeof(buf), in)) > 0)
+		if (fwrite(buf, 1, r, out) != r) { ok = 0; break; }
+	fclose(in);
+	if (fclose(out) != 0) ok = 0;
+	if (!ok) { unlink(tmp); kvm_flog("kvm_sync: copy failed\n"); return; }
+
+	chmod(tmp, 0755);
+	if (chown(tmp, 0, 0) != 0) { /* best effort */ }
+	// Rename rather than overwrite: the kvmagent may be executing the old file,
+	// and a rename swaps only the directory entry, leaving its inode intact.
+	if (rename(tmp, dst) != 0) { unlink(tmp); kvm_flog("kvm_sync: rename failed\n"); return; }
+	kvm_flog("kvm_sync: refreshed %s from the daemon binary\n", dst);
+
+	// Restart the console user's LaunchAgent so the new binary takes effect now
+	// rather than at the next login. kickstart -k also bypasses ThrottleInterval.
+	uid_t cuid = 0;
+	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("meshagent-sync"), NULL, NULL);
+	if (store != NULL)
+	{
+		CFStringRef name = SCDynamicStoreCopyConsoleUser(store, &cuid, NULL);
+		if (name != NULL) CFRelease(name); else cuid = 0;
+		CFRelease(store);
+	}
+	if (cuid > 0)
+	{
+		char cmd[192];
+		snprintf(cmd, sizeof(cmd),
+			"/bin/launchctl kickstart -k gui/%u/meshagent-launchagent >/dev/null 2>&1",
+			(unsigned)cuid);
+		(void)system(cmd);
+		kvm_flog("kvm_sync: restarted the kvmagent for uid %u\n", (unsigned)cuid);
+	}
+}
+
 void kvm_check_permission()
 {
+	// Do this first: a daemon that has just self-updated should bring its KVM
+	// copy along before anything else looks at permissions or capture.
+	kvm_sync_agent_copy();
+
 
     //Request screen recording access
     if(__builtin_available(macOS 10.15, *)){
