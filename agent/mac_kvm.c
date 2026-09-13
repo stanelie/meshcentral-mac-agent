@@ -106,7 +106,7 @@ CGDirectDisplayID SCREEN_NUM = 0;
 #define KVM_MAX_DISPLAYS 16
 CGDirectDisplayID SCREEN_LIST[KVM_MAX_DISPLAYS];
 int SCREEN_COUNT = 0;
-int SCREEN_SEL   = 0;   // 1-based index into SCREEN_LIST; 0 = none chosen = main
+int SCREEN_SEL   = 1;   // 1-based index into SCREEN_LIST; 0 = ALL displays combined
 
 // Origin of the selected display in the global coordinate space.
 //
@@ -240,7 +240,7 @@ void kvm_refresh_display_list(void)
 	if (SCREEN_COUNT == 0) { SCREEN_LIST[0] = CGMainDisplayID(); SCREEN_COUNT = 1; }
 	// A display can be unplugged mid-session; fall back to the main one rather
 	// than capturing an ID that no longer exists.
-	if (SCREEN_SEL > SCREEN_COUNT) SCREEN_SEL = 0;
+	if (SCREEN_SEL > SCREEN_COUNT) SCREEN_SEL = 1;
 }
 
 // Backing scale of a display, from the display itself.
@@ -288,13 +288,96 @@ CGDirectDisplayID kvm_selected_display(void)
 	return CGMainDisplayID();
 }
 
+// Bounds of what is being captured, in points, in the global coordinate space.
+// For a single display that is its own bounds; for ALL it is the union, whose
+// origin is NOT (0,0) whenever a display sits left of or above the main one.
+CGRect kvm_selected_bounds(void)
+{
+	if (SCREEN_SEL != 0) return CGDisplayBounds(kvm_selected_display());
+	CGRect u = CGRectNull;
+	for (int i = 0; i < SCREEN_COUNT; i++) u = CGRectUnion(u, CGDisplayBounds(SCREEN_LIST[i]));
+	if (CGRectIsNull(u)) u = CGDisplayBounds(CGMainDisplayID());
+	return u;
+}
+
+// Scale to render at. Displays can differ -- measured on the test VM, one at 1x
+// and one at 2x -- so a combined image takes the largest, and the smaller
+// display is simply drawn scaled up into its rectangle rather than losing the
+// detail of the sharper one.
+int kvm_selected_scale(void)
+{
+	if (SCREEN_SEL != 0) return kvm_display_scale(kvm_selected_display());
+	int best = 1;
+	for (int i = 0; i < SCREEN_COUNT; i++)
+	{
+		int sc = kvm_display_scale(SCREEN_LIST[i]);
+		if (sc > best) best = sc;
+	}
+	return best;
+}
+
+// Capture every display into one image laid out as the desktop actually is.
+//
+// Deliberately self-contained rather than reusing the single-display fallback
+// chain: that chain carries the login-window capture work (SkyLight private
+// API, SCK, TCC-dependent ordering) which took the longest to get right, and a
+// combined view is not worth destabilising it. The last resort here is
+// CGWindowListCreateImage over CGRectInfinite, which is itself a whole-desktop
+// composite -- the correct answer for this mode, just slower.
+static CGImageRef kvm_capture_all_displays(void)
+{
+	CGRect u  = kvm_selected_bounds();
+	int    sc = kvm_selected_scale();
+	size_t w  = (size_t)(u.size.width  * sc);
+	size_t h  = (size_t)(u.size.height * sc);
+	if (w == 0 || h == 0) return NULL;
+
+	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	if (cs == NULL) return NULL;
+	CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, 0, cs,
+		kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+	CGColorSpaceRelease(cs);
+	if (ctx == NULL) return NULL;
+
+	int drew = 0;
+	for (int i = 0; i < SCREEN_COUNT; i++)
+	{
+		CGDirectDisplayID d = SCREEN_LIST[i];
+		CGImageRef img = CGDisplayCreateImage(d);
+		if (img == NULL) { extern CGImageRef kvm_capture_sck(uint32_t); img = kvm_capture_sck((uint32_t)d); }
+		if (img == NULL) continue;
+		CGRect b = CGDisplayBounds(d);
+		// Display bounds are top-left origin with y increasing downward; a bitmap
+		// context is bottom-left with y increasing upward, so the row has to be
+		// flipped or the lower monitor lands above the upper one.
+		CGRect dst = CGRectMake(
+			(b.origin.x - u.origin.x) * sc,
+			(u.origin.y + u.size.height - (b.origin.y + b.size.height)) * sc,
+			b.size.width  * sc,
+			b.size.height * sc);
+		CGContextDrawImage(ctx, dst, img);
+		CGImageRelease(img);
+		drew++;
+	}
+
+	CGImageRef out = NULL;
+	if (drew > 0) out = CGBitmapContextCreateImage(ctx);
+	CGContextRelease(ctx);
+	if (out == NULL)
+	{
+		static int logged = 0;
+		if (!logged) { kvm_flog("capture_all: per-display capture failed, compositing window list\n"); logged = 1; }
+		out = CGWindowListCreateImage(CGRectInfinite, kCGWindowListOptionOnScreenOnly,
+			kCGNullWindowID, kCGWindowImageDefault);
+	}
+	return out;
+}
+
 // Tell the viewer which displays exist. Wire format matches the Windows agent:
 // [type][size][count][id...][selected], 2 bytes each, count = number of ids.
 //
-// The "all displays as one image" entry (65535) that Windows offers is NOT
-// advertised: SCContentFilter is per-display, so a combined view needs a
-// composite over the union rect that does not exist yet. Better to offer only
-// what actually works than to list an option that returns a blank screen.
+// 65535 is the "all displays as one image" entry; the viewer labels exactly that
+// value "All Displays" and shows no such button unless the agent sends it.
 void kvm_send_display_list(void)
 {
 	kvm_refresh_display_list();
@@ -314,18 +397,22 @@ void kvm_send_display_list(void)
 		return;
 	}
 
-	int n   = SCREEN_COUNT;
-	int sel = (SCREEN_SEL >= 1 && SCREEN_SEL <= n) ? SCREEN_SEL : 1;
+	// Entries: "All Displays" (65535) first, as the Windows agent sends it, then
+	// one per physical display.
+	int n   = SCREEN_COUNT + 1;
+	int sel = (SCREEN_SEL == 0) ? 65535
+	        : ((SCREEN_SEL >= 1 && SCREEN_SEL <= SCREEN_COUNT) ? SCREEN_SEL : 1);
 	int sz  = 8 + (2 * n);
 	char *buffer = ILibMemory_SmartAllocate(sz);
 	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);
 	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)sz);
 	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)n);
-	for (int i = 0; i < n; i++)
-		((unsigned short*)buffer)[3 + i] = (unsigned short)htons((unsigned short)(i + 1));
+	((unsigned short*)buffer)[3] = (unsigned short)htons((unsigned short)65535);
+	for (int i = 0; i < SCREEN_COUNT; i++)
+		((unsigned short*)buffer)[4 + i] = (unsigned short)htons((unsigned short)(i + 1));
 	((unsigned short*)buffer)[3 + n] = (unsigned short)htons((unsigned short)sel);
 
-	kvm_flog("kvm_send_display_list: count=%d selected=%d\n", n, sel);
+	kvm_flog("kvm_send_display_list: count=%d (incl. All) selected=%d\n", n, sel);
 	ILibQueue_Lock(g_messageQ);
 	ILibQueue_EnQueue(g_messageQ, buffer);
 	ILibQueue_UnLock(g_messageQ);
@@ -473,12 +560,18 @@ int kvm_init()
 	kvm_refresh_display_list();
 	SCREEN_NUM = kvm_selected_display();
 	{
-		CGRect b = CGDisplayBounds(SCREEN_NUM);
+		// In ALL mode the captured area is the union of every display, so the
+		// origin that mouse coordinates must be offset by is the union's origin,
+		// which is not (0,0) whenever a display sits left of or above the main one.
+		CGRect b = kvm_selected_bounds();
 		SCREEN_ORIGIN_X = (int)b.origin.x;
 		SCREEN_ORIGIN_Y = (int)b.origin.y;
-		kvm_flog("kvm_init: display %d/%d id=%u origin=(%d,%d)\n",
-			SCREEN_SEL ? SCREEN_SEL : 1, SCREEN_COUNT, SCREEN_NUM,
-			SCREEN_ORIGIN_X, SCREEN_ORIGIN_Y);
+		if (SCREEN_SEL == 0)
+			kvm_flog("kvm_init: ALL %d displays, union %.0fx%.0f origin=(%d,%d)\n",
+				SCREEN_COUNT, b.size.width, b.size.height, SCREEN_ORIGIN_X, SCREEN_ORIGIN_Y);
+		else
+			kvm_flog("kvm_init: display %d/%d id=%u origin=(%d,%d)\n",
+				SCREEN_SEL, SCREEN_COUNT, SCREEN_NUM, SCREEN_ORIGIN_X, SCREEN_ORIGIN_Y);
 	}
 	if (__builtin_available(macOS 10.15, *))
 	{
@@ -495,7 +588,7 @@ int kvm_init()
 		kvm_flog("kvm_init: display id=%u uid=%d\n", SCREEN_NUM, (int)getuid());
 	}
 	
-	SCREEN_SCALE = kvm_display_scale(SCREEN_NUM);
+	SCREEN_SCALE = kvm_selected_scale();
 
 	kvm_flog("kvm_init: CGDisplayIsActive=%d CGDisplayIsOnline=%d\n",
 		(int)CGDisplayIsActive(SCREEN_NUM), (int)CGDisplayIsOnline(SCREEN_NUM));
@@ -511,8 +604,11 @@ int kvm_init()
 				ret, exists, (long long)(exists ? st.st_size : 0));
 		}
 	}
-	SCREEN_HEIGHT = CGDisplayPixelsHigh(SCREEN_NUM) * SCREEN_SCALE;
-	SCREEN_WIDTH = CGDisplayPixelsWide(SCREEN_NUM) * SCREEN_SCALE;
+	{
+		CGRect sb = kvm_selected_bounds();
+		SCREEN_HEIGHT = (int)(sb.size.height * SCREEN_SCALE);
+		SCREEN_WIDTH  = (int)(sb.size.width  * SCREEN_SCALE);
+	}
 	kvm_flog("kvm_init: SCREEN_WIDTH=%d SCREEN_HEIGHT=%d SCREEN_SCALE=%d\n", SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_SCALE);
 	// Some magic numbers.
 	TILE_WIDTH = 32;
@@ -659,18 +755,27 @@ int kvm_server_inputdata(char* block, int blocklen)
 			// 65535 means "all displays" in this protocol. We do not advertise
 			// that option (no composite capture yet), but a viewer can still ask
 			// for it -- fall back to the first display rather than blanking.
-			int newsel = (v == 65535) ? 1 : (int)v;
+			int newsel = (v == 65535) ? 0 : (int)v;   // 0 = all displays combined
 			// Log the RAW request unconditionally, before any early return. Every
 			// rejection path below used to be silent, which meant a switch that did
 			// nothing left no trace at all and could not be told apart from a switch
 			// that was never sent.
 			kvm_flog("MNG_KVM_SET_DISPLAY: raw=%u -> want=%d (have %d, current %d)\n",
 				(unsigned)v, newsel, SCREEN_COUNT, SCREEN_SEL);
-			if (newsel < 1 || newsel > SCREEN_COUNT) { kvm_flog("  ignored: out of range\n"); break; }
+			if (newsel < 0 || newsel > SCREEN_COUNT) { kvm_flog("  ignored: out of range\n"); break; }
 			if (newsel == SCREEN_SEL) { kvm_flog("  ignored: already selected\n"); break; }
 			SCREEN_SEL = newsel;
-			kvm_flog("MNG_KVM_SET_DISPLAY: -> %d/%d (id=%u)\n",
-				SCREEN_SEL, SCREEN_COUNT, kvm_selected_display());
+			if (SCREEN_SEL == 0)
+			{
+				CGRect u = kvm_selected_bounds();
+				kvm_flog("MNG_KVM_SET_DISPLAY: -> ALL (%d displays, union %.0fx%.0f at %.0f,%.0f)\n",
+					SCREEN_COUNT, u.size.width, u.size.height, u.origin.x, u.origin.y);
+			}
+			else
+			{
+				kvm_flog("MNG_KVM_SET_DISPLAY: -> %d/%d (id=%u)\n",
+					SCREEN_SEL, SCREEN_COUNT, kvm_selected_display());
+			}
 			// No further work needed here: the main loop compares SCREEN_NUM with
 			// the selected display every frame and already re-runs kvm_init() on a
 			// change, which re-sends the resolution and rebuilds the tile cache.
@@ -1021,9 +1126,10 @@ void* kvm_server_mainloop(void* param)
 		// ever revised SCREEN_SCALE upward and then latched it (SCREEN_SCALE_SET),
 		// which cannot survive switching to a display with a different scale.
 		{
-			int sc = kvm_display_scale(screen_num);
-			screen_height = (int)CGDisplayPixelsHigh(screen_num) * sc;
-			screen_width  = (int)CGDisplayPixelsWide(screen_num) * sc;
+			CGRect sb = kvm_selected_bounds();
+			int    sc = kvm_selected_scale();
+			screen_height = (int)(sb.size.height * sc);
+			screen_width  = (int)(sb.size.width  * sc);
 		}
 		
 		if ((SCREEN_HEIGHT != screen_height || (SCREEN_WIDTH != screen_width) || SCREEN_NUM != screen_num))
@@ -1038,7 +1144,13 @@ void* kvm_server_mainloop(void* param)
 		//senddebug(screen_num);
 		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 		CGImageRef image = NULL;
-		if (getuid() == 0)
+		if (SCREEN_SEL == 0)
+		{
+			image = kvm_capture_all_displays();
+			static int logged_all = 0;
+			if (!logged_all) { kvm_flog("capture: ALL displays, image=%p\n", image); logged_all = 1; }
+		}
+		else if (getuid() == 0)
 		{
 			// loginwindow (uid=0). ScreenCaptureKit is preferred but only exists on
 			// macOS 14+, so on older systems kvm_capture_sck() returns NULL. Fall
