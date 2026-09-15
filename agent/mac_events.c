@@ -85,6 +85,16 @@ static IOHIDUserDeviceRef g_mouse_dev = NULL;
 //     before the queued Cmd-down had actually been posted, read a state with
 //     no Command set, and went out bare. The shortcut never formed. Setting
 //     the flags ourselves removes the race entirely.
+// Per-uid, for the same reason as the agent log in mac_kvm.c: the Aqua and
+// LoginWindow agents both write here, and a file created by root at boot locks
+// the console user's agent out of its own diagnostics entirely.
+static FILE *kvm_key_log_open(void)
+{
+    char p[64];
+    snprintf(p, sizeof(p), "/tmp/kvm_key_debug-%u.log", (unsigned)getuid());
+    return fopen(p, "a");
+}
+
 static CGEventFlags g_modFlags = 0;
 
 // Map a modifier VK to its CGEvent flag. Returns 0 for non-modifier keys.
@@ -148,7 +158,7 @@ static void kvm_apply_mod_flags(CGEventRef e)
         if (now - last >= 5)
         {
             last = now;
-            FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
+            FILE *_f = kvm_key_log_open();
             if (_f)
             {
                 fprintf(_f, "FLAG-LEAK inherited=0x%llx tracked=0x%llx leaked=0x%llx t=%ld\n",
@@ -649,7 +659,7 @@ static void post_cgevent_locked(CGEventRef e)
     // STDOUT_FILENO message went to /dev/null under launchd, hiding every drop.
     if (dispatch_semaphore_wait(g_postSem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)POST_WAIT_MS * NSEC_PER_MSEC)) != 0) {
-        FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
+        FILE *_f = kvm_key_log_open();
         if (_f) { fprintf(_f, "EVENT-DROPPED (queue saturated %d) t=%ld\n", POST_MAX_INFLIGHT, (long)time(NULL)); fclose(_f); }
         return;
     }
@@ -1639,7 +1649,7 @@ void KeyAction(unsigned char vk, int up)
 		CGEventFlags mf = vk_mod_flag(vk);
 		if (mf) {
 			if (up) { g_modFlags &= ~mf; } else { g_modFlags |= mf; }
-			FILE *_f = fopen("/tmp/kvm_key_debug.log", "a");
+			FILE *_f = kvm_key_log_open();
 			if (_f) {
 				fprintf(_f, "MODIFIER vk=0x%02x %s -> g_modFlags=0x%llx (cmd=%d shift=%d ctrl=%d opt=%d) t=%ld\n",
 					vk, up ? "UP  " : "DOWN", (unsigned long long)g_modFlags,

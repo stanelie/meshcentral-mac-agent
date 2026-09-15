@@ -41,8 +41,33 @@ limitations under the License.
 #include <SystemConfiguration/SystemConfiguration.h>
 
 // Temporary diagnostic log for loginwindow KVM debugging
+// Log path is PER-UID, and that is not cosmetic.
+//
+// Two kvmagents run from the same LaunchAgent: one in the console user's Aqua
+// session and one as ROOT in the LoginWindow session. They used to share
+// /tmp/kvm_debug.log, and whichever created it first owned it. On a Mac that
+// boots to the login window -- i.e. the normal case -- root gets there first and
+// creates it 0644 root:wheel, after which the user-session agent cannot append
+// at all and logs NOTHING.
+//
+// That silently broke the installer's permission walkthrough, which reads this
+// log to ask the agent whether a grant took. Measured on a deployed Mac
+// 2026-09-15: Accessibility and Screen Recording were both granted (auth_value=2
+// in TCC.db) and the walkthrough still reported them ungranted forever, because
+// the only line in the log was "AXIsProcessTrusted=0 at startup (uid=0)" from
+// the ROOT agent -- which correctly has no Accessibility in the LoginWindow
+// session, and whose answer is not the one being asked about.
+//
+// Splitting by uid fixes both halves: no cross-uid permission collision, and a
+// reader gets the agent that shares its own session rather than the last writer.
+static void kvm_log_path(char *out, size_t outsz)
+{
+    snprintf(out, outsz, "/tmp/kvm_debug-%u.log", (unsigned)getuid());
+}
+
 static void kvm_flog(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/kvm_debug.log", "a");
+    char _p[64]; kvm_log_path(_p, sizeof(_p));
+    FILE *f = fopen(_p, "a");
     if (!f) return;
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fflush(f); fclose(f);
@@ -1909,12 +1934,15 @@ static void perm_fake_kvm_session(void)
 //     "kvm_init: ... preflight=%d"
 // perm_fake_kvm_session() makes it re-run both, then we read the freshest line.
 
-#define PERM_AGENT_LOG "/tmp/kvm_debug.log"
+// The walkthrough runs as the console user, so this resolves to the log of the
+// agent in that same session -- the one whose grants it is actually asking about.
+#define PERM_AGENT_LOG_FMT "/tmp/kvm_debug-%u.log"
 
 // Last integer following `key` in the agent's log, or `deflt` if never seen.
 static int perm_log_last_int(const char *key, int deflt)
 {
-    FILE *f = fopen(PERM_AGENT_LOG, "r");
+    char _p[64]; snprintf(_p, sizeof(_p), PERM_AGENT_LOG_FMT, (unsigned)getuid());
+    FILE *f = fopen(_p, "r");
     if (!f) return deflt;
     char line[1024];
     int val = deflt;
