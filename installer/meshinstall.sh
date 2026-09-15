@@ -102,7 +102,17 @@ cat > "/Library/LaunchDaemons/$SV.plist" <<PL
 <key>ProgramArguments</key><array><string>$D/$EXE</string></array>
 <key>WorkingDirectory</key><string>$D/</string>
 <key>RunAtLoad</key><true/>
-<key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
+<!-- Unconditional, not {Crashed:true}. MeshCentral's self-update replaces this
+     binary underneath the running process, and the kernel then SIGKILLs it for
+     a code-signing violation. Measured on a deployed Mac 2026-09-15:
+         last exit reason = OS_REASON_CODESIGNING
+         state = not running        runs = 6
+     launchd did NOT bring it back, so every successful agent update left the
+     machine with no management agent at all -- offline in the console until
+     someone restarted it by hand, which is not something a remote-management
+     agent may do to itself. Restart it whatever the reason it stopped; the
+     uninstaller boots the job out, so nothing here fights a deliberate removal. -->
+<key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>5</integer>
 </dict></plist>
 PL
