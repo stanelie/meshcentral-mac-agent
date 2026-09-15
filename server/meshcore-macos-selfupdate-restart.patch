@@ -1,0 +1,29 @@
+--- a/agents/meshcore.js
++++ b/agents/meshcore.js	2026-09-15 14:52:27.943616493 -0400
+@@ -6733,6 +6733,26 @@
+                             case 'linux':
+                                 linux_execv(name, agentfilename, sessionid);
+                                 break;
++                            case 'darwin':
++                                // macOS restarts through launchd. Without this the 'default'
++                                // branch below runs, and service-manager's restart() throws on
++                                // macOS -- so 'force agent update' downloaded and installed the
++                                // new binary correctly and then reported 'Self Update
++                                // encountered an error trying to restart service', leaving the
++                                // OLD process running against the NEW binary on disk until
++                                // someone restarted it by hand. The agent's own C path already
++                                // does exactly this (agentcore.c, PlatformTypes_LAUNCHD); only
++                                // this JS update path was missing it.
++                                try {
++                                    var c = require('child_process').execFile('/bin/sh', ['sh']);
++                                    c.stdin.write('launchctl kickstart -k system/' + name + '\nexit\n');
++                                    c.waitExit();
++                                }
++                                catch (ex) {
++                                    sendConsoleText('Self Update encountered an error trying to restart service', sessionid);
++                                    sendAgentMessage('Self Update encountered an error trying to restart service', 3);
++                                }
++                                break;
+                             default:
+                                 try {
+                                     // restart service

@@ -16,7 +16,11 @@
 #include <stdio.h>
 
 static void sck_flog(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/kvm_debug.log", "a");
+    // Per-uid: see kvm_flog in mac_kvm.c. Sharing one path between the root and
+    // console-user agents lets whichever starts first lock the other out.
+    char _p[64];
+    snprintf(_p, sizeof(_p), "/tmp/kvm_debug-%u.log", (unsigned)getuid());
+    FILE *f = fopen(_p, "a");
     if (!f) return;
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fflush(f); fclose(f);

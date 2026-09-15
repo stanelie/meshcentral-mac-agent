@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..be4c7ec 100644
+index b70a508..e395518 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -24,10 +24,22 @@ index b70a508..be4c7ec 100644
  #endif
  
  
-@@ -102,6 +103,32 @@ int main(int argc, char **argv)
+@@ -102,6 +103,44 @@ int main(int argc, char **argv)
  	int retCode = 0;
  	int capabilities = 0;
  
++#if defined(__APPLE__)
++// Per-uid, matching kvm_flog in mac_kvm.c. The Aqua and LoginWindow agents both
++// log, and a file created by root at boot is not writable by the console user --
++// which silently cost the installer's Accessibility check its only input.
++static FILE *kvm_dbg_open(void)
++{
++	char _p[64];
++	snprintf(_p, sizeof(_p), "/tmp/kvm_debug-%u.log", (unsigned)getuid());
++	return fopen(_p, "a");
++}
++#endif
++
 +#if defined(__APPLE__)
 +	{
 +		// Absolute earliest diagnostic log — before any arg checks or init.
@@ -57,7 +69,7 @@ index b70a508..be4c7ec 100644
  #ifdef WIN32
  	int argvi, argvsz;
  	char **argv = (char**)ILibMemory_SmartAllocate(argc * sizeof(void*));
-@@ -303,6 +330,46 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -303,6 +342,46 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  		kvm_server_mainloop((void*)(uint64_t)getpid());
  		return 0;
  	}
@@ -104,7 +116,7 @@ index b70a508..be4c7ec 100644
  	else if (argc > 1 && strcasecmp(argv[1], "-kvmagent") == 0)
  	{
  		// User-context LaunchAgent mode: long-running KVM server that
-@@ -327,8 +394,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
+@@ -327,8 +406,95 @@ char* crashMemory = ILib_POSIX_InstallCrashHandler(argv[0]);
  				"/tmp/meshagent-kvm-%u.sock", (unsigned)getuid());
  			kvm_set_listener_path(defaultPath);
  		}
@@ -119,7 +131,7 @@ index b70a508..be4c7ec 100644
 +			if (getuid() == 0)
 +			{
 +				int joinRC = ILibProcessPipe_JoinWindowServerAuditSession_OSX();
-+				FILE *_f = fopen("/tmp/kvm_debug.log", "a");
++				FILE *_f = kvm_dbg_open();
 +				if (_f) { fprintf(_f, "JoinWindowServerAuditSession rc=%d\n", joinRC); fclose(_f); }
 +			}
 +			else
@@ -135,7 +147,7 @@ index b70a508..be4c7ec 100644
 +			extern int CGSNewConnection(int, CGSConnectionID *);
 +			CGSConnectionID cgCid = 0;
 +			int cgRC = CGSNewConnection(0, &cgCid);
-+			FILE *_f = fopen("/tmp/kvm_debug.log", "a");
++			FILE *_f = kvm_dbg_open();
 +			if (_f) { fprintf(_f, "CGSNewConnection rc=%d cid=%d\n", cgRC, cgCid); fclose(_f); }
 +		}
 +		// Request Accessibility permission if not already granted (Aqua only).
@@ -144,7 +156,7 @@ index b70a508..be4c7ec 100644
 +		if (__builtin_available(macOS 10.9, *))
 +		{
 +			int _axTrusted = (int)AXIsProcessTrusted();
-+			FILE *_axf = fopen("/tmp/kvm_debug.log", "a");
++			FILE *_axf = kvm_dbg_open();
 +			if (_axf) { fprintf(_axf, "AXIsProcessTrusted=%d at startup (uid=%d)\n", _axTrusted, (int)getuid()); fclose(_axf); }
 +			if (!_axTrusted && getuid() != 0)
 +			{
@@ -3486,10 +3498,10 @@ index 6d57690..7714ebb 100644
 \ No newline at end of file
 diff --git a/meshcore/KVM/MacOS/mac_kvm_sck.m b/meshcore/KVM/MacOS/mac_kvm_sck.m
 new file mode 100644
-index 0000000..cb8f518
+index 0000000..f46a5d7
 --- /dev/null
 +++ b/meshcore/KVM/MacOS/mac_kvm_sck.m
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,299 @@
 +/*
 + * ScreenCaptureKit wrapper for MeshAgent KVM.
 + *
@@ -3508,7 +3520,11 @@ index 0000000..cb8f518
 +#include <stdio.h>
 +
 +static void sck_flog(const char *fmt, ...) {
-+    FILE *f = fopen("/tmp/kvm_debug.log", "a");
++    // Per-uid: see kvm_flog in mac_kvm.c. Sharing one path between the root and
++    // console-user agents lets whichever starts first lock the other out.
++    char _p[64];
++    snprintf(_p, sizeof(_p), "/tmp/kvm_debug-%u.log", (unsigned)getuid());
++    FILE *f = fopen(_p, "a");
 +    if (!f) return;
 +    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
 +    fflush(f); fclose(f);
