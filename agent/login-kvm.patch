@@ -13,7 +13,7 @@ index fb8c1c5..eb25892 100644
  	$(STRIP)
  
 diff --git a/meshconsole/main.c b/meshconsole/main.c
-index b70a508..e395518 100644
+index b70a508..ee566a0 100644
 --- a/meshconsole/main.c
 +++ b/meshconsole/main.c
 @@ -43,6 +43,7 @@ char __agentExecPath[1024] = { 0 };
@@ -24,10 +24,10 @@ index b70a508..e395518 100644
  #endif
  
  
-@@ -102,6 +103,44 @@ int main(int argc, char **argv)
- 	int retCode = 0;
- 	int capabilities = 0;
- 
+@@ -89,6 +90,18 @@ ILibTransport_DoneState kvm_serviceWriteSink(char *buffer, int bufferLen, void *
+ #define wmain_free(argv) for(argvi=0;argvi<(int)(ILibMemory_Size(argv)/sizeof(void*));++argvi){ILibMemory_Free(argv[argvi]);}ILibMemory_Free(argv);
+ int wmain(int argc, char **wargv)
+ #else
 +#if defined(__APPLE__)
 +// Per-uid, matching kvm_flog in mac_kvm.c. The Aqua and LoginWindow agents both
 +// log, and a file created by root at boot is not writable by the console user --
@@ -40,6 +40,13 @@ index b70a508..e395518 100644
 +}
 +#endif
 +
+ int main(int argc, char **argv)
+ #endif
+ {
+@@ -102,6 +115,32 @@ int main(int argc, char **argv)
+ 	int retCode = 0;
+ 	int capabilities = 0;
+ 
 +#if defined(__APPLE__)
 +	{
 +		// Absolute earliest diagnostic log — before any arg checks or init.
@@ -2025,7 +2032,7 @@ index d6bb534..94eb8b0 100644
  #endif /* LINUX_EVENTS_H_ */
 +void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..7714ebb 100644
+index 6d57690..741f833 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -2918,7 +2925,7 @@ index 6d57690..7714ebb 100644
  	}
  }
  
-@@ -1150,8 +1766,515 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,8 +1766,533 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -3404,8 +3411,26 @@ index 6d57690..7714ebb 100644
 +	if (rename(tmp, dst) != 0) { unlink(tmp); kvm_flog("kvm_sync: rename failed\n"); return; }
 +	kvm_flog("kvm_sync: refreshed %s from the daemon binary\n", dst);
 +
-+	// Restart the console user's LaunchAgent so the new binary takes effect now
-+	// rather than at the next login. kickstart -k also bypasses ThrottleInterval.
++	// Restart EVERY kvmagent, not just the console user's.
++	//
++	// The same LaunchAgent is loaded into both the Aqua and the LoginWindow
++	// session types, so there are normally two of them: one as the console user
++	// and one as root at the login window. kickstart on gui/<uid> reaches only
++	// the first. Observed on a deployed Mac 2026-09-15: after a successful
++	// refresh the console agent was 43 seconds old and the LOGIN-WINDOW agent was
++	// still 30 minutes old, i.e. still executing the previous binary -- which in
++	// that instance was the build with the SkyLight deadlock, so login-window
++	// connections would have kept coming up black despite the update having
++	// "worked".
++	//
++	// Signalling them is enough: KeepAlive is {SuccessfulExit: false}, so a
++	// signal death counts as unsuccessful and launchd brings each one back, in
++	// its own session, running the new binary.
++	(void)system("/usr/bin/pkill -f 'kvm/meshagent -kvmagent' >/dev/null 2>&1");
++
++	// Then kickstart the console user's explicitly: that one is the interactive
++	// session, and kickstart bypasses ThrottleInterval so it returns at once
++	// instead of after the restart delay.
 +	uid_t cuid = 0;
 +	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("meshagent-sync"), NULL, NULL);
 +	if (store != NULL)
@@ -3434,7 +3459,7 @@ index 6d57690..7714ebb 100644
  
      //Request screen recording access
      if(__builtin_available(macOS 10.15, *)){
-@@ -1190,4 +2313,60 @@ void kvm_check_permission()
+@@ -1190,4 +2331,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

@@ -2248,8 +2248,26 @@ void kvm_sync_agent_copy(void)
 	if (rename(tmp, dst) != 0) { unlink(tmp); kvm_flog("kvm_sync: rename failed\n"); return; }
 	kvm_flog("kvm_sync: refreshed %s from the daemon binary\n", dst);
 
-	// Restart the console user's LaunchAgent so the new binary takes effect now
-	// rather than at the next login. kickstart -k also bypasses ThrottleInterval.
+	// Restart EVERY kvmagent, not just the console user's.
+	//
+	// The same LaunchAgent is loaded into both the Aqua and the LoginWindow
+	// session types, so there are normally two of them: one as the console user
+	// and one as root at the login window. kickstart on gui/<uid> reaches only
+	// the first. Observed on a deployed Mac 2026-09-15: after a successful
+	// refresh the console agent was 43 seconds old and the LOGIN-WINDOW agent was
+	// still 30 minutes old, i.e. still executing the previous binary -- which in
+	// that instance was the build with the SkyLight deadlock, so login-window
+	// connections would have kept coming up black despite the update having
+	// "worked".
+	//
+	// Signalling them is enough: KeepAlive is {SuccessfulExit: false}, so a
+	// signal death counts as unsuccessful and launchd brings each one back, in
+	// its own session, running the new binary.
+	(void)system("/usr/bin/pkill -f 'kvm/meshagent -kvmagent' >/dev/null 2>&1");
+
+	// Then kickstart the console user's explicitly: that one is the interactive
+	// session, and kickstart bypasses ThrottleInterval so it returns at once
+	// instead of after the restart delay.
 	uid_t cuid = 0;
 	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("meshagent-sync"), NULL, NULL);
 	if (store != NULL)
