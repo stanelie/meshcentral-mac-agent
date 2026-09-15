@@ -2004,7 +2004,7 @@ index d6bb534..94eb8b0 100644
  #endif /* LINUX_EVENTS_H_ */
 +void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..863dd14 100644
+index 6d57690..7714ebb 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -2095,7 +2095,7 @@ index 6d57690..863dd14 100644
  int SH_HANDLE = 0;
  int SCREEN_WIDTH = 0;
  int SCREEN_HEIGHT = 0;
-@@ -151,6 +215,235 @@ void kvm_send_resolution()
+@@ -151,6 +215,255 @@ void kvm_send_resolution()
  	ILibQueue_UnLock(g_messageQ);
  }
  
@@ -2198,12 +2198,32 @@ index 6d57690..863dd14 100644
 +	return CGMainDisplayID();
 +}
 +
++// Is the combined "all displays" view actually in effect?
++//
++// Honoured only in a USER session. At the login window the composite path would
++// bypass the single-display capture chain -- the SkyLight / CGWindowList / SCK
++// ordering that took the longest here to get working -- and use only
++// CGDisplayCreateImage plus SCK, which are exactly the two that fail there on
++// some machines. The result is a black login-window screen.
++//
++// That is not hypothetical exposure: the viewer REMEMBERS the chosen display
++// (deskPreferedStickyDisplay in default.handlebars) and re-sends it on connect,
++// so once an operator picks All Displays in a user session, every later
++// connection asks for it too -- including the login window.
++//
++// There is normally a single display at the login window in any case, so
++// falling back to it there costs nothing.
++static int kvm_combined_mode(void)
++{
++	return (SCREEN_SEL == 0 && getuid() != 0);
++}
++
 +// Bounds of what is being captured, in points, in the global coordinate space.
 +// For a single display that is its own bounds; for ALL it is the union, whose
 +// origin is NOT (0,0) whenever a display sits left of or above the main one.
 +CGRect kvm_selected_bounds(void)
 +{
-+	if (SCREEN_SEL != 0) return CGDisplayBounds(kvm_selected_display());
++	if (!kvm_combined_mode()) return CGDisplayBounds(kvm_selected_display());
 +	CGRect u = CGRectNull;
 +	for (int i = 0; i < SCREEN_COUNT; i++) u = CGRectUnion(u, CGDisplayBounds(SCREEN_LIST[i]));
 +	if (CGRectIsNull(u)) u = CGDisplayBounds(CGMainDisplayID());
@@ -2216,7 +2236,7 @@ index 6d57690..863dd14 100644
 +// detail of the sharper one.
 +int kvm_selected_scale(void)
 +{
-+	if (SCREEN_SEL != 0) return kvm_display_scale(kvm_selected_display());
++	if (!kvm_combined_mode()) return kvm_display_scale(kvm_selected_display());
 +	int best = 1;
 +	for (int i = 0; i < SCREEN_COUNT; i++)
 +	{
@@ -2331,7 +2351,7 @@ index 6d57690..863dd14 100644
  #define BUFSIZE 65535
  
  int set_kbd_state(int input_state)
-@@ -289,18 +582,60 @@ int kvm_init()
+@@ -289,18 +602,60 @@ int kvm_init()
  {
  	ILibCriticalLogFilename = "KVMSlave.log";
  	int old_height_count = TILE_HEIGHT_COUNT;
@@ -2368,11 +2388,11 @@ index 6d57690..863dd14 100644
 +		bool pre = CGPreflightScreenCaptureAccess();
 +		kvm_flog("kvm_init: display id=%u preflight=%d uid=%d\n",
 +			SCREEN_NUM, (int)pre, (int)getuid());
-+	}
+ 	}
 +	else
 +	{
 +		kvm_flog("kvm_init: display id=%u uid=%d\n", SCREEN_NUM, (int)getuid());
- 	}
++	}
 +	
 +	SCREEN_SCALE = kvm_selected_scale();
  
@@ -2401,7 +2421,7 @@ index 6d57690..863dd14 100644
  	// Some magic numbers.
  	TILE_WIDTH = 32;
  	TILE_HEIGHT = 32;
-@@ -312,13 +647,24 @@ int kvm_init()
+@@ -312,13 +667,24 @@ int kvm_init()
  	if (SCREEN_WIDTH % TILE_WIDTH) { TILE_WIDTH_COUNT++; }
  	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
  	
@@ -2428,7 +2448,7 @@ index 6d57690..863dd14 100644
  
  	// Write the reply to the pipe.
  	ILibQueue_Lock(g_messageQ);
-@@ -341,6 +687,12 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -341,6 +707,12 @@ int kvm_server_inputdata(char* block, int blocklen)
  	type = ntohs(((unsigned short*)(block))[0]);
  	size = ntohs(((unsigned short*)(block))[1]);
  
@@ -2441,7 +2461,7 @@ index 6d57690..863dd14 100644
  	if (size > blocklen) return 0;
  
  	switch (type)
-@@ -416,6 +768,45 @@ int kvm_server_inputdata(char* block, int blocklen)
+@@ -416,6 +788,50 @@ int kvm_server_inputdata(char* block, int blocklen)
  			//if (fr > 20 && fr < 2000) FRAME_RATE_TIMER = fr;
  			break;
  		}
@@ -2468,7 +2488,12 @@ index 6d57690..863dd14 100644
 +			if (newsel < 0 || newsel > SCREEN_COUNT) { kvm_flog("  ignored: out of range\n"); break; }
 +			if (newsel == SCREEN_SEL) { kvm_flog("  ignored: already selected\n"); break; }
 +			SCREEN_SEL = newsel;
-+			if (SCREEN_SEL == 0)
++			if (SCREEN_SEL == 0 && getuid() == 0)
++			{
++				kvm_flog("MNG_KVM_SET_DISPLAY: -> ALL requested at the login window; "
++					"using a single display there (composite bypasses the login-window capture path)\n");
++			}
++			else if (SCREEN_SEL == 0)
 +			{
 +				CGRect u = kvm_selected_bounds();
 +				kvm_flog("MNG_KVM_SET_DISPLAY: -> ALL (%d displays, union %.0fx%.0f at %.0f,%.0f)\n",
@@ -2487,7 +2512,7 @@ index 6d57690..863dd14 100644
  	}
  
  	return size;
-@@ -484,7 +875,7 @@ void* kvm_mainloopinput(void* param)
+@@ -484,7 +900,7 @@ void* kvm_mainloopinput(void* param)
  	int ptr = 0;
  	int ptr2 = 0;
  	int len = 0;
@@ -2496,7 +2521,7 @@ index 6d57690..863dd14 100644
  	int cbBytesRead = 0;
  
  	char tmp[255];
-@@ -507,6 +898,35 @@ void* kvm_mainloopinput(void* param)
+@@ -507,6 +923,35 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		KvmDebugLog("Reading from master in kvm_mainloopinput\n");
@@ -2532,7 +2557,7 @@ index 6d57690..863dd14 100644
  		cbBytesRead = read(KVM_AGENT_FD == -1 ? STDIN_FILENO: KVM_AGENT_FD, pchRequest2 + len, 30000 - len);
  		KvmDebugLog("Read %d bytes from master in kvm_mainloopinput\n", cbBytesRead);
  
-@@ -539,7 +959,7 @@ void* kvm_mainloopinput(void* param)
+@@ -539,7 +984,7 @@ void* kvm_mainloopinput(void* param)
  			write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
  		}
@@ -2541,7 +2566,7 @@ index 6d57690..863dd14 100644
  
  		if (KVM_AGENT_FD != -1)
  		{
-@@ -549,7 +969,7 @@ void* kvm_mainloopinput(void* param)
+@@ -549,7 +994,7 @@ void* kvm_mainloopinput(void* param)
  		}
  
  		if (ptr == len) { len = 0; ptr = 0; }
@@ -2550,7 +2575,7 @@ index 6d57690..863dd14 100644
  	}
  
  	return 0;
-@@ -557,16 +977,11 @@ void* kvm_mainloopinput(void* param)
+@@ -557,16 +1002,11 @@ void* kvm_mainloopinput(void* param)
  void ExitSink(int s)
  {
  	UNREFERENCED_PARAMETER(s);
@@ -2572,7 +2597,7 @@ index 6d57690..863dd14 100644
  }
  void* kvm_server_mainloop(void* param)
  {
-@@ -637,6 +1052,7 @@ void* kvm_server_mainloop(void* param)
+@@ -637,6 +1077,7 @@ void* kvm_server_mainloop(void* param)
  		{
  			written = write(STDOUT_FILENO, "ACCEPT ERROR ON DOMAIN SOCKET", 29);
  			fsync(STDOUT_FILENO);
@@ -2580,7 +2605,7 @@ index 6d57690..863dd14 100644
  			return(NULL);
  		}
  		else
-@@ -645,12 +1061,15 @@ void* kvm_server_mainloop(void* param)
+@@ -645,12 +1086,15 @@ void* kvm_server_mainloop(void* param)
  			int tmpLen = sprintf_s(tmp, sizeof(tmp), "ACCEPTed new connection %d on Domain Socket\n", KVM_AGENT_FD);
  			written = write(STDOUT_FILENO, tmp, tmpLen);
  			fsync(STDOUT_FILENO);
@@ -2598,7 +2623,7 @@ index 6d57690..863dd14 100644
  
  
  	g_shutdown = 0;
-@@ -723,37 +1142,165 @@ void* kvm_server_mainloop(void* param)
+@@ -723,37 +1167,165 @@ void* kvm_server_mainloop(void* param)
  			}
  		}
  
@@ -2648,7 +2673,7 @@ index 6d57690..863dd14 100644
 -		if (image == NULL) 
 +		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 +		CGImageRef image = NULL;
-+		if (SCREEN_SEL == 0)
++		if (kvm_combined_mode())
 +		{
 +			image = kvm_capture_all_displays();
 +			static int logged_all = 0;
@@ -2678,9 +2703,7 @@ index 6d57690..863dd14 100644
 +			}
 +		}
 +		else
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
 +			// display directly instead of compositing the window list, and measured
 +			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
@@ -2764,7 +2787,9 @@ index 6d57690..863dd14 100644
 +			}
 +		}
 +		if (image == NULL)
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// Last resort: ScreenCaptureKit (macOS 14+). Uses a separate
 +			// system daemon, so its TCC check may differ from the CoreGraphics
 +			// path and might succeed at the loginwindow.
@@ -2784,7 +2809,7 @@ index 6d57690..863dd14 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1535,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -988,7 +1560,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -2810,7 +2835,7 @@ index 6d57690..863dd14 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1616,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1641,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -2872,7 +2897,7 @@ index 6d57690..863dd14 100644
  	}
  }
  
-@@ -1150,8 +1741,515 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,8 +1766,515 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -3388,7 +3413,7 @@ index 6d57690..863dd14 100644
  
      //Request screen recording access
      if(__builtin_available(macOS 10.15, *)){
-@@ -1190,4 +2288,60 @@ void kvm_check_permission()
+@@ -1190,4 +2313,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }

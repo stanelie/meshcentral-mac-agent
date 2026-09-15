@@ -314,12 +314,32 @@ CGDirectDisplayID kvm_selected_display(void)
 	return CGMainDisplayID();
 }
 
+// Is the combined "all displays" view actually in effect?
+//
+// Honoured only in a USER session. At the login window the composite path would
+// bypass the single-display capture chain -- the SkyLight / CGWindowList / SCK
+// ordering that took the longest here to get working -- and use only
+// CGDisplayCreateImage plus SCK, which are exactly the two that fail there on
+// some machines. The result is a black login-window screen.
+//
+// That is not hypothetical exposure: the viewer REMEMBERS the chosen display
+// (deskPreferedStickyDisplay in default.handlebars) and re-sends it on connect,
+// so once an operator picks All Displays in a user session, every later
+// connection asks for it too -- including the login window.
+//
+// There is normally a single display at the login window in any case, so
+// falling back to it there costs nothing.
+static int kvm_combined_mode(void)
+{
+	return (SCREEN_SEL == 0 && getuid() != 0);
+}
+
 // Bounds of what is being captured, in points, in the global coordinate space.
 // For a single display that is its own bounds; for ALL it is the union, whose
 // origin is NOT (0,0) whenever a display sits left of or above the main one.
 CGRect kvm_selected_bounds(void)
 {
-	if (SCREEN_SEL != 0) return CGDisplayBounds(kvm_selected_display());
+	if (!kvm_combined_mode()) return CGDisplayBounds(kvm_selected_display());
 	CGRect u = CGRectNull;
 	for (int i = 0; i < SCREEN_COUNT; i++) u = CGRectUnion(u, CGDisplayBounds(SCREEN_LIST[i]));
 	if (CGRectIsNull(u)) u = CGDisplayBounds(CGMainDisplayID());
@@ -332,7 +352,7 @@ CGRect kvm_selected_bounds(void)
 // detail of the sharper one.
 int kvm_selected_scale(void)
 {
-	if (SCREEN_SEL != 0) return kvm_display_scale(kvm_selected_display());
+	if (!kvm_combined_mode()) return kvm_display_scale(kvm_selected_display());
 	int best = 1;
 	for (int i = 0; i < SCREEN_COUNT; i++)
 	{
@@ -791,7 +811,12 @@ int kvm_server_inputdata(char* block, int blocklen)
 			if (newsel < 0 || newsel > SCREEN_COUNT) { kvm_flog("  ignored: out of range\n"); break; }
 			if (newsel == SCREEN_SEL) { kvm_flog("  ignored: already selected\n"); break; }
 			SCREEN_SEL = newsel;
-			if (SCREEN_SEL == 0)
+			if (SCREEN_SEL == 0 && getuid() == 0)
+			{
+				kvm_flog("MNG_KVM_SET_DISPLAY: -> ALL requested at the login window; "
+					"using a single display there (composite bypasses the login-window capture path)\n");
+			}
+			else if (SCREEN_SEL == 0)
 			{
 				CGRect u = kvm_selected_bounds();
 				kvm_flog("MNG_KVM_SET_DISPLAY: -> ALL (%d displays, union %.0fx%.0f at %.0f,%.0f)\n",
@@ -1170,7 +1195,7 @@ void* kvm_server_mainloop(void* param)
 		//senddebug(screen_num);
 		extern CGImageRef kvm_capture_sck(uint32_t displayID);
 		CGImageRef image = NULL;
-		if (SCREEN_SEL == 0)
+		if (kvm_combined_mode())
 		{
 			image = kvm_capture_all_displays();
 			static int logged_all = 0;
