@@ -202,10 +202,10 @@ index b70a508..be4c7ec 100644
  #endif
  
 diff --git a/meshcore/KVM/MacOS/mac_events.c b/meshcore/KVM/MacOS/mac_events.c
-index c27e1f0..2047972 100644
+index c27e1f0..10407ba 100644
 --- a/meshcore/KVM/MacOS/mac_events.c
 +++ b/meshcore/KVM/MacOS/mac_events.c
-@@ -2,13 +2,1297 @@
+@@ -2,13 +2,1306 @@
  #include <assert.h>
  #include <SystemConfiguration/SystemConfiguration.h>
  #include <string.h>
@@ -832,12 +832,24 @@ index c27e1f0..2047972 100644
 +    g_source  = CGEventSourceCreate(kCGEventSourceStatePrivate);
 +    g_lw_pid  = find_proc_by_name("loginwindow");
 +    { char b[96]; int l=snprintf(b,sizeof(b),"cg_fallback: source=%p lw_pid=%d\n",(void*)g_source,(int)g_lw_pid); write(STDOUT_FILENO,b,l); }
-+    // Clear an OS-level latch inherited from a PREVIOUS process. A private event
-+    // source stops us inheriting the system's modifier state into new events; it
-+    // does nothing about a modifier the system itself still holds down. This is
-+    // the only hook that covers a session whose process was killed outright, so
-+    // it must run here rather than only on viewer re-attach.
-+    release_stuck_modifiers_locked();
++    // NOTHING that calls into CoreGraphics/SkyLight may go here.
++    //
++    // This function body runs inside dispatch_once_f(&g_postOnce). Calling
++    // release_stuck_modifiers_locked() from here deadlocked the LOGIN-WINDOW
++    // agent outright -- sampled on an affected Mac 2026-09-15:
++    //
++    //     _dispatch_once_callout
++    //       -> SLEventSourceFlagsState (SkyLight)
++    //         -> CGSEventSourceForID
++    //           -> CGSEventSourceShutdown      [__psynch_mutexwait]
++    //
++    // The agent reached "kvm_init OK" and then stopped forever: no frames, no
++    // input, a black screen in the viewer, while Apple's own Screen Sharing to
++    // the same machine worked fine. The trigger is kvm_reset_modifiers() on
++    // viewer attach, which primes this once-token -- so it fired on every
++    // login-window connection.
++    //
++    // The release now happens in post_cgevent, AFTER the once has completed.
 +}
 +
 +typedef struct { CGEventRef e; } PostCtx;
@@ -881,6 +893,11 @@ index c27e1f0..2047972 100644
 +static void post_cgevent(CGEventRef e)
 +{
 +    dispatch_once_f(&g_postOnce, NULL, post_init_once);
++    // Once per process, and deliberately out here rather than in post_init_once:
++    // see the note there. By this point the once has returned, so SkyLight calls
++    // are not being made from inside its callout.
++    static int released = 0;
++    if (!released) { released = 1; release_stuck_modifiers_locked(); }
 +    post_cgevent_locked(e);
 +}
 +
@@ -908,19 +925,11 @@ index c27e1f0..2047972 100644
 +        kVK_Command, kVK_RightCommand,
 +        kVK_Function,
 +    };
-+    // Measurement, not decoration. This is the only place that can say whether a
-+    // modifier was ACTUALLY latched, and it is logged before the release so the
-+    // value is the evidence rather than the result. If the symptom recurs, this
-+    // line answers "was a modifier stuck?" directly instead of by inference.
-+    // Reading it after the release would prove nothing anyway: the posts below
-+    // are queued asynchronously and have not been delivered yet.
-+    CGEventFlags held = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
-+    { char b[128]; int l = snprintf(b, sizeof(b),
-+        "release_stuck_modifiers: HID flags before release = 0x%llx%s\n",
-+        (unsigned long long)held,
-+        (held & (kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate
-+                 | kCGEventFlagMaskCommand | kCGEventFlagMaskSecondaryFn)) ? "  <-- LATCHED" : "");
-+      write(STDOUT_FILENO, b, l); }
++    // NOTE: this used to log CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState)
++    // first, as evidence of whether a modifier was really latched. That query is
++    // what deadlocked the login-window agent (see post_init_once), and it is not
++    // worth a black screen: the FLAG-LEAK line in kvm_apply_mod_flags reports the
++    // same condition from flags we already own, without asking SkyLight anything.
 +
 +    for (size_t i = 0; i < sizeof(mods) / sizeof(mods[0]); i++)
 +    {
@@ -1506,7 +1515,7 @@ index c27e1f0..2047972 100644
  
  static struct keymap_t g_keymap[] = {
  	{ kVK_Space,		 VK_SPACE },
-@@ -132,193 +1416,343 @@ void kvm_server_sendmsg(char *msg)
+@@ -132,193 +1425,343 @@ void kvm_server_sendmsg(char *msg)
  {
  	int msgLen = strnlen_s(msg, 255);
  	char buffer[512];
