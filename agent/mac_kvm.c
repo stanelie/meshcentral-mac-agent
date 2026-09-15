@@ -2187,6 +2187,90 @@ static int kvm_files_identical(const char *a, const char *b)
 	return same;
 }
 
+// Make sure the LaunchDaemon restarts unconditionally.
+//
+// MeshCentral's self-update replaces this binary underneath the running
+// process, and the kernel then SIGKILLs it for a code-signing violation.
+// Installs made before 2026-09-15 carry KeepAlive {Crashed: true}, and launchd
+// did NOT bring the agent back from that -- measured on a deployed Mac:
+//     last exit reason = OS_REASON_CODESIGNING
+//     state = not running        runs = 6
+// So a SUCCESSFUL update could leave a machine with no management agent, which
+// is the one failure a remote agent cannot ask you to fix remotely.
+//
+// The installer now writes KeepAlive <true/>, but a plist is not carried by an
+// agent update -- only the binary is -- so already-deployed Macs keep the old
+// one. Repairing it from here is the only route that needs nobody at a keyboard.
+//
+// The reload runs in a DETACHED helper on purpose: bootout terminates this very
+// process, so the bootstrap half must outlive us or the job is left unloaded.
+// Worst case that still ends at "offline until a reboot", which is exactly where
+// the machine would have been anyway.
+//
+// Only acts when the plist is actually wrong, so it cannot loop: once repaired,
+// every later start reads "true" and returns immediately.
+void kvm_fix_daemon_keepalive(void)
+{
+	if (getuid() != 0) return;
+	const char *P = "/Library/LaunchDaemons/meshagent.plist";
+	struct stat st;
+	if (stat(P, &st) != 0) return;          // not our layout -- leave it alone
+
+	int already = 0;
+	FILE *f = popen("/usr/libexec/PlistBuddy -c 'Print :KeepAlive' "
+	                "/Library/LaunchDaemons/meshagent.plist 2>/dev/null", "r");
+	if (f != NULL)
+	{
+		char b[64];
+		if (fgets(b, sizeof(b), f) != NULL && strncmp(b, "true", 4) == 0) already = 1;
+		pclose(f);
+	}
+	if (already) return;
+
+	kvm_flog("kvm_keepalive: LaunchDaemon does not restart unconditionally -- repairing\n");
+
+	// Edit the file SYNCHRONOUSLY. This is the part that must not be lost, and an
+	// earlier version did lose it: the whole repair was handed to one backgrounded
+	// `nohup sh -c '...' &` through system(), the function logged that it was
+	// repairing, and the plist was never touched. Keep the must-happen work here,
+	// in plain sight, and detach only what genuinely cannot run in this process.
+	(void)system("/bin/cp -p /Library/LaunchDaemons/meshagent.plist "
+	             "/Library/LaunchDaemons/meshagent.plist.bak-keepalive >/dev/null 2>&1");
+	(void)system("/usr/libexec/PlistBuddy -c 'Delete :KeepAlive' "
+	             "/Library/LaunchDaemons/meshagent.plist >/dev/null 2>&1");
+	(void)system("/usr/libexec/PlistBuddy -c 'Add :KeepAlive bool true' "
+	             "/Library/LaunchDaemons/meshagent.plist >/dev/null 2>&1");
+	if (system("/usr/bin/plutil -lint /Library/LaunchDaemons/meshagent.plist >/dev/null 2>&1") != 0)
+	{
+		// Never leave an unparseable LaunchDaemon behind: launchd would refuse to
+		// load it and the machine would lose its agent permanently.
+		(void)system("/bin/cp -p /Library/LaunchDaemons/meshagent.plist.bak-keepalive "
+		             "/Library/LaunchDaemons/meshagent.plist >/dev/null 2>&1");
+		kvm_flog("kvm_keepalive: edit produced an invalid plist -- restored the original\n");
+		return;
+	}
+	kvm_flog("kvm_keepalive: plist repaired; reloading the job\n");
+
+	// launchd caches the job definition, so only bootout+bootstrap picks the new
+	// KeepAlive up; a restart alone re-reads nothing. bootout kills THIS process,
+	// so the bootstrap half has to live outside it. fork+setsid, not a backgrounded
+	// shell: the child is then in its own session and is not torn down with the job.
+	{
+		pid_t pid = fork();
+		if (pid == 0)
+		{
+			setsid();
+			execl("/bin/sh", "sh", "-c",
+				"sleep 3; "
+				"/bin/launchctl bootout system /Library/LaunchDaemons/meshagent.plist >/dev/null 2>&1; "
+				"sleep 2; "
+				"/bin/launchctl bootstrap system /Library/LaunchDaemons/meshagent.plist >/dev/null 2>&1",
+				(char *)NULL);
+			_exit(127);
+		}
+	}
+}
+
 // Keep <dir>/kvm/<exe> in step with the daemon binary.
 //
 // MeshCentral updates the DAEMON on its own -- that is what the console's
@@ -2289,9 +2373,11 @@ void kvm_sync_agent_copy(void)
 
 void kvm_check_permission()
 {
-	// Do this first: a daemon that has just self-updated should bring its KVM
-	// copy along before anything else looks at permissions or capture.
-	kvm_sync_agent_copy();
+	// NOTE: this function is DEAD CODE on macOS. Its only call site, in
+	// agentcore.c, is guarded by #if defined(_LINKVM), and the makefile's macos
+	// target never defines it. Startup work belongs in main(), which is where
+	// kvm_sync_agent_copy() and kvm_fix_daemon_keepalive() are called from --
+	// they were briefly wired up here instead and silently never ran.
 
 
     //Request screen recording access
