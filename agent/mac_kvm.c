@@ -2203,11 +2203,15 @@ static int perm_wait(const char *label, int (*check)(void), const char *pane)
             // since a refresh restarts the agent and can disturb a prompt the
             // operator is still looking at.
             {
+                // Both permissions now self-report within ~3s of being
+                // granted (ax_poll_thread and sc_poll_thread), so this waits
+                // on the agent's own report and forces nothing. One refresh
+                // near the end covers an agent that died rather than reported.
                 int granted = 0;
-                for (int i = 0; i < 30 && !granted; i++)      // ~90 seconds
+                for (int i = 0; i < 60 && !granted; i++)      // ~3 minutes
                 {
                     sleep(3);
-                    if ((i % 10) == 9) perm_refresh_agent_status();   // ~every 30s
+                    if (i == 45) perm_refresh_agent_status();
                     granted = check();
                 }
                 if (granted) { printf("      -> %s granted\n", label); return 1; }
@@ -2676,6 +2680,39 @@ void kvm_check_permission()
 // exits with code 2 so launchd restarts the process. The restarted process
 // will call AXIsProcessTrustedWithOptions and get true on the first check,
 // making CGEventPost work immediately without manual intervention.
+// Report Screen Recording the way Accessibility already reports itself.
+//
+// Accessibility is quick to confirm during the install because ax_poll_thread
+// notices the grant within ~3s and re-execs, which writes a fresh
+// "AXIsProcessTrusted=" line. Screen Recording had no equivalent: "preflight="
+// only ever appeared from kvm_init, i.e. when a session ran. So the walkthrough
+// had to FORCE a session to learn anything, and each of those costs a 6s hold
+// plus a kickstart plus a wait for the agent to come back -- which is what made
+// the operator sit through minutes of apparently idle dialogs.
+//
+// Polling here instead costs one cheap call every 3 seconds while the grant is
+// missing, and nothing at all once it lands. Logged only on CHANGE, so the file
+// does not fill with repeats.
+static void* sc_poll_thread(void* arg)
+{
+    (void)arg;
+    int last = -1;
+    for (;;)
+    {
+        int ok = 0;
+        if (__builtin_available(macOS 10.15, *)) ok = CGPreflightScreenCaptureAccess() ? 1 : 0;
+        if (ok != last)
+        {
+            last = ok;
+            // "preflight=" is the key the installer's check reads; keep it.
+            kvm_flog("screencapture poll: preflight=%d (uid=%d)\n", ok, (int)getuid());
+        }
+        if (ok) break;          // granted -- nothing further to watch for
+        sleep(3);
+    }
+    return NULL;
+}
+
 static void* ax_poll_thread(void* arg)
 {
     (void)arg;
@@ -2723,6 +2760,15 @@ int kvmagent_ax_poll_start(void)
             pthread_create(&t, NULL, ax_poll_thread, NULL);
             pthread_detach(t);
         }
+    }
+
+    // Always start the Screen Recording watcher, granted or not: it logs the
+    // current value once so the installer has something to read before any
+    // session has run, then exits if there is nothing to wait for.
+    {
+        pthread_t t2;
+        pthread_create(&t2, NULL, sc_poll_thread, NULL);
+        pthread_detach(t2);
     }
     return 0;
 }
