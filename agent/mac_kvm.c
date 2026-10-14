@@ -1329,6 +1329,43 @@ void* kvm_server_mainloop(void* param)
 		}
 		else {
 			//senddebug(100);
+			// Never hand getScreenBuffer an image that disagrees with the geometry
+			// the frame was sized for.
+			//
+			// That function (mac_tile.c, upstream) allocates its output from the
+			// SOURCE image's byte count, but writes 3 bytes per pixel PLUS a
+			// per-row pad of (adjust_screen_size(SCREEN_WIDTH) - width) * 3 in
+			// UNSIGNED arithmetic. An image WIDER than SCREEN_WIDTH underflows that
+			// to roughly four billion and the pad loop walks straight off the heap;
+			// an image narrower than SCREEN_WIDTH overruns too, because 3 bytes of
+			// output per pixel plus padding exceeds the 4 bytes of source it was
+			// sized from once the pad is wide enough.
+			//
+			// Seen as a SIGSEGV on 2026-10-14 while connecting to a LOCKED screen:
+			//     EXC_BAD_ACCESS KERN_INVALID_ADDRESS at 0x0cc0fec000
+			//     __bzero <- meshagent
+			// The agent died mid-session, which is what the viewer showed as a
+			// black screen. Skipping the frame costs a dropped frame; the
+			// alternative costs the whole agent.
+			{
+				int _iw = (int)CGImageGetWidth(image);
+				int _ih = (int)CGImageGetHeight(image);
+				if (_iw != SCREEN_WIDTH || _ih != SCREEN_HEIGHT)
+				{
+					static time_t _lastlog = 0;
+					time_t _now = time(NULL);
+					if (_now - _lastlog >= 5)
+					{
+						_lastlog = _now;
+						kvm_flog("capture %dx%d != frame %dx%d -- dropping frame "
+							"(uid=%d, would have overrun the tile buffer)\n",
+							_iw, _ih, SCREEN_WIDTH, SCREEN_HEIGHT, (int)getuid());
+					}
+					CGImageRelease(image);
+					if (!g_resetipc && !g_shutdown) usleep(200000);
+					continue;
+				}
+			}
 			getScreenBuffer((unsigned char **)&desktop, &desktopsize, image);
 
 			if (KVM_AGENT_FD != -1)

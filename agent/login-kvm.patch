@@ -2037,7 +2037,7 @@ index d6bb534..94eb8b0 100644
  #endif /* LINUX_EVENTS_H_ */
 +void vnc_probe_once(void);
 diff --git a/meshcore/KVM/MacOS/mac_kvm.c b/meshcore/KVM/MacOS/mac_kvm.c
-index 6d57690..e4f3215 100644
+index 6d57690..0aef897 100644
 --- a/meshcore/KVM/MacOS/mac_kvm.c
 +++ b/meshcore/KVM/MacOS/mac_kvm.c
 @@ -15,6 +15,7 @@ limitations under the License.
@@ -2421,11 +2421,11 @@ index 6d57690..e4f3215 100644
 +		bool pre = CGPreflightScreenCaptureAccess();
 +		kvm_flog("kvm_init: display id=%u preflight=%d uid=%d\n",
 +			SCREEN_NUM, (int)pre, (int)getuid());
- 	}
++	}
 +	else
 +	{
 +		kvm_flog("kvm_init: display id=%u uid=%d\n", SCREEN_NUM, (int)getuid());
-+	}
+ 	}
 +	
 +	SCREEN_SCALE = kvm_selected_scale();
  
@@ -2656,7 +2656,7 @@ index 6d57690..e4f3215 100644
  
  
  	g_shutdown = 0;
-@@ -723,37 +1167,165 @@ void* kvm_server_mainloop(void* param)
+@@ -723,40 +1167,205 @@ void* kvm_server_mainloop(void* param)
  			}
  		}
  
@@ -2736,7 +2736,9 @@ index 6d57690..e4f3215 100644
 +			}
 +		}
 +		else
-+		{
+ 		{
+-			g_shutdown = 1;
+-			senddebug(0);
 +			// User session (uid != 0). Prefer CGDisplayCreateImage: it captures the
 +			// display directly instead of compositing the window list, and measured
 +			// ~150-300x faster than CGWindowListCreateImage on macOS 15+ (that API
@@ -2820,9 +2822,7 @@ index 6d57690..e4f3215 100644
 +			}
 +		}
 +		if (image == NULL)
- 		{
--			g_shutdown = 1;
--			senddebug(0);
++		{
 +			// Last resort: ScreenCaptureKit (macOS 14+). Uses a separate
 +			// system daemon, so its TCC check may differ from the CoreGraphics
 +			// path and might succeed at the loginwindow.
@@ -2842,7 +2842,47 @@ index 6d57690..e4f3215 100644
  		}
  		else {
  			//senddebug(100);
-@@ -988,7 +1560,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
++			// Never hand getScreenBuffer an image that disagrees with the geometry
++			// the frame was sized for.
++			//
++			// That function (mac_tile.c, upstream) allocates its output from the
++			// SOURCE image's byte count, but writes 3 bytes per pixel PLUS a
++			// per-row pad of (adjust_screen_size(SCREEN_WIDTH) - width) * 3 in
++			// UNSIGNED arithmetic. An image WIDER than SCREEN_WIDTH underflows that
++			// to roughly four billion and the pad loop walks straight off the heap;
++			// an image narrower than SCREEN_WIDTH overruns too, because 3 bytes of
++			// output per pixel plus padding exceeds the 4 bytes of source it was
++			// sized from once the pad is wide enough.
++			//
++			// Seen as a SIGSEGV on 2026-10-14 while connecting to a LOCKED screen:
++			//     EXC_BAD_ACCESS KERN_INVALID_ADDRESS at 0x0cc0fec000
++			//     __bzero <- meshagent
++			// The agent died mid-session, which is what the viewer showed as a
++			// black screen. Skipping the frame costs a dropped frame; the
++			// alternative costs the whole agent.
++			{
++				int _iw = (int)CGImageGetWidth(image);
++				int _ih = (int)CGImageGetHeight(image);
++				if (_iw != SCREEN_WIDTH || _ih != SCREEN_HEIGHT)
++				{
++					static time_t _lastlog = 0;
++					time_t _now = time(NULL);
++					if (_now - _lastlog >= 5)
++					{
++						_lastlog = _now;
++						kvm_flog("capture %dx%d != frame %dx%d -- dropping frame "
++							"(uid=%d, would have overrun the tile buffer)\n",
++							_iw, _ih, SCREEN_WIDTH, SCREEN_HEIGHT, (int)getuid());
++					}
++					CGImageRelease(image);
++					if (!g_resetipc && !g_shutdown) usleep(200000);
++					continue;
++				}
++			}
+ 			getScreenBuffer((unsigned char **)&desktop, &desktopsize, image);
+ 
+ 			if (KVM_AGENT_FD != -1)
+@@ -988,7 +1597,24 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  		char socketPath[128];
  		snprintf(socketPath, sizeof(socketPath), "/tmp/meshagent-kvm-%d.sock", uid);
  		struct stat sockStat;
@@ -2868,7 +2908,7 @@ index 6d57690..e4f3215 100644
  
  		if (agentInstalled)
  		{
-@@ -1052,20 +1641,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
+@@ -1052,20 +1678,47 @@ void* kvm_relay_setup(char *exePath, void *processPipeMgr, ILibKVM_WriteHandler
  	}
  	else
  	{
@@ -2930,7 +2970,7 @@ index 6d57690..e4f3215 100644
  	}
  }
  
-@@ -1150,8 +1766,619 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
+@@ -1150,8 +1803,619 @@ MPAuthorizationStatus _fullDiskAuthorizationStatus() {
  }
  
  
@@ -3550,7 +3590,7 @@ index 6d57690..e4f3215 100644
  
      //Request screen recording access
      if(__builtin_available(macOS 10.15, *)){
-@@ -1190,4 +2417,60 @@ void kvm_check_permission()
+@@ -1190,4 +2454,60 @@ void kvm_check_permission()
              CFRelease(URL);
          }
      }
