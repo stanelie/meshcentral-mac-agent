@@ -72,12 +72,16 @@ if [ -n "${CUID:-}" ] && [ "${CUSER:-root}" != "root" ]; then
         # deletes its own plist as the user at the end -- on a root-owned
         # directory that rm fails silently and the job comes back at every
         # single login, which is exactly what the self-deletion exists to stop.
+        # Unconditionally, not just when creating: install.sh runs BEFORE this
+        # and used to create ~/Library/LaunchAgents as root itself, so guarding
+        # on "does not exist" skipped the very case that needed fixing (measured
+        # on the VM: the fix was present and the directory was still root-owned,
+        # because it already existed by the time this ran). Older installs are in
+        # that state too, so repair it whatever we find.
         for dir in "$AGENTS" "$SUPPORT"; do
-            if [ ! -d "$dir" ]; then
-                /bin/mkdir -p "$dir"
-                /usr/sbin/chown "$CUSER" "$dir"
-                /bin/chmod 755 "$dir"
-            fi
+            [ -d "$dir" ] || /bin/mkdir -p "$dir"
+            /usr/sbin/chown "$CUSER" "$dir" 2>/dev/null
+            /bin/chmod 755 "$dir" 2>/dev/null
         done
 
         /bin/cat > "$RUNNER" <<'RUNNEREOF'

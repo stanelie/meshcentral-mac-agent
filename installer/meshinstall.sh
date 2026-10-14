@@ -349,7 +349,18 @@ if [ -n "$CUID" ] && [ "$CUSER" != "root" ] && [ -n "$CUSER" ]; then
     CHOME=$(dscl . -read "/Users/$CUSER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
     if [ -n "$CHOME" ]; then
         WD="$CHOME/Library/Application Support/MeshAgent"; WL="$CHOME/Library/LaunchAgents"
-        mkdir -p "$WD" "$WL"
+        # Creating these as root and forgetting to hand them back is a real bug,
+        # not a tidiness point: `mkdir -p` as root left ~/Library/LaunchAgents
+        # owned by root with mode 0700, so the user who owns the home directory
+        # could not even list it -- confirmed on a clean VM 2026-10-14,
+        # "drwx------ root". Every install did this, and it breaks anything else
+        # that wants to put a LaunchAgent in the user's own directory, not just
+        # us. $WD was chowned below; $WL never was.
+        for _d in "$WD" "$WL"; do
+            [ -d "$_d" ] || mkdir -p "$_d"
+            chown "$CUSER" "$_d" 2>/dev/null
+            chmod 755 "$_d" 2>/dev/null
+        done
         cat > "$WD/tcc-watcher.sh" <<WSH
 #!/bin/bash
 KP="/Library/LaunchAgents/$SV.plist"; [ -f "\$KP" ] || exit 0
@@ -357,7 +368,7 @@ U=\$(id -u); sleep 1
 /bin/launchctl bootout "gui/\$U" "\$KP" 2>/dev/null; sleep 1
 /bin/launchctl bootstrap "gui/\$U" "\$KP" 2>/dev/null
 WSH
-        chmod 755 "$WD/tcc-watcher.sh"; chown "$CUSER" "$WD/tcc-watcher.sh" "$WD"
+        chmod 755 "$WD/tcc-watcher.sh"; chown "$CUSER" "$WD/tcc-watcher.sh"
         cat > "$WL/com.meshagent.tcc-watcher.plist" <<WLP
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
