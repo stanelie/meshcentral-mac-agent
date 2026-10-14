@@ -2224,6 +2224,20 @@ static int kvm_files_identical(const char *a, const char *b)
 	return same;
 }
 
+// uid of the console user, or 0 when nobody is logged in.
+static uid_t kvm_console_uid(void)
+{
+	uid_t cuid = 0;
+	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("meshagent-sync"), NULL, NULL);
+	if (store != NULL)
+	{
+		CFStringRef name = SCDynamicStoreCopyConsoleUser(store, &cuid, NULL);
+		if (name != NULL) CFRelease(name); else cuid = 0;
+		CFRelease(store);
+	}
+	return cuid;
+}
+
 // Make sure the LaunchDaemon restarts unconditionally.
 //
 // MeshCentral's self-update replaces this binary underneath the running
@@ -2364,45 +2378,55 @@ void kvm_sync_agent_copy(void)
 
 	chmod(tmp, 0755);
 	if (chown(tmp, 0, 0) != 0) { /* best effort */ }
-	// Rename rather than overwrite: the kvmagent may be executing the old file,
-	// and a rename swaps only the directory entry, leaving its inode intact.
+	// Stop the agents BEFORE swapping the file, and wait for them to actually go.
+	//
+	// Replacing the binary under a RUNNING kvmagent gets it killed by the KERNEL,
+	// not by us: the image stops matching what was mapped, so it dies with
+	// SIGKILL (Code Signature Invalid) / "Launch Constraint Violation" and macOS
+	// files a crash report. It self-healed, but leaving crash reports behind as
+	// part of a routine update is misleading -- whoever next opens Console sees
+	// two agent crashes for every fleet update with no way to know they were
+	// expected.
+	//
+	// Both session types have to be covered. Booting the console user's job out
+	// also stops launchd restarting it into the middle of the swap; any
+	// LoginWindow instance is signalled, and launchd brings that one back by
+	// itself once the rename has landed.
+	{
+		uid_t scuid = kvm_console_uid();
+		if (scuid > 0)
+		{
+			char cmd[200];
+			snprintf(cmd, sizeof(cmd),
+				"/bin/launchctl bootout gui/%u /Library/LaunchAgents/meshagent.plist "
+				">/dev/null 2>&1", (unsigned)scuid);
+			(void)system(cmd);
+		}
+		(void)system("/usr/bin/pkill -f 'kvm/meshagent -kvmagent' >/dev/null 2>&1");
+		// Wait for them to be gone rather than guessing a sleep: the whole point
+		// is that the swap happens with nothing executing the old image.
+		for (int i = 0; i < 40; i++)
+		{
+			if (system("/usr/bin/pgrep -f 'kvm/meshagent -kvmagent' >/dev/null 2>&1") != 0) break;
+			usleep(100000);
+		}
+	}
+
+	// Rename rather than overwrite: atomic, and nothing is executing it now.
 	if (rename(tmp, dst) != 0) { unlink(tmp); kvm_flog("kvm_sync: rename failed\n"); return; }
 	kvm_flog("kvm_sync: refreshed %s from the daemon binary\n", dst);
-
-	// Restart EVERY kvmagent, not just the console user's.
-	//
-	// The same LaunchAgent is loaded into both the Aqua and the LoginWindow
-	// session types, so there are normally two of them: one as the console user
-	// and one as root at the login window. kickstart on gui/<uid> reaches only
-	// the first. Observed on a deployed Mac 2026-09-15: after a successful
-	// refresh the console agent was 43 seconds old and the LOGIN-WINDOW agent was
-	// still 30 minutes old, i.e. still executing the previous binary -- which in
-	// that instance was the build with the SkyLight deadlock, so login-window
-	// connections would have kept coming up black despite the update having
-	// "worked".
-	//
-	// Signalling them is enough: KeepAlive is {SuccessfulExit: false}, so a
-	// signal death counts as unsuccessful and launchd brings each one back, in
-	// its own session, running the new binary.
-	(void)system("/usr/bin/pkill -f 'kvm/meshagent -kvmagent' >/dev/null 2>&1");
 
 	// Then kickstart the console user's explicitly: that one is the interactive
 	// session, and kickstart bypasses ThrottleInterval so it returns at once
 	// instead of after the restart delay.
-	uid_t cuid = 0;
-	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("meshagent-sync"), NULL, NULL);
-	if (store != NULL)
-	{
-		CFStringRef name = SCDynamicStoreCopyConsoleUser(store, &cuid, NULL);
-		if (name != NULL) CFRelease(name); else cuid = 0;
-		CFRelease(store);
-	}
+	uid_t cuid = kvm_console_uid();
 	if (cuid > 0)
 	{
-		char cmd[192];
+		char cmd[320];
 		snprintf(cmd, sizeof(cmd),
+			"/bin/launchctl bootstrap gui/%u /Library/LaunchAgents/meshagent.plist >/dev/null 2>&1; "
 			"/bin/launchctl kickstart -k gui/%u/meshagent-launchagent >/dev/null 2>&1",
-			(unsigned)cuid);
+			(unsigned)cuid, (unsigned)cuid);
 		(void)system(cmd);
 		kvm_flog("kvm_sync: restarted the kvmagent for uid %u\n", (unsigned)cuid);
 	}
