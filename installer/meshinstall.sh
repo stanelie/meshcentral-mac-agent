@@ -396,54 +396,70 @@ if [ "${MESH_SKIP_PERMS:-0}" != "1" ] && [ -n "$CUID" ] && [ -n "$CUSER" ] && [ 
     # redirections left to right, so `: >/dev/tty 2>/dev/null` attempts the
     # /dev/tty open while stderr is still the real stderr, and prints the very
     # "Device not configured" line this test exists to avoid.
-    if : 2>/dev/null >/dev/tty; then
-        # Apple's OWN Screen Sharing helper needs consent too, separately from
-        # anything meshagent asks for. Login-window input is driven through
-        # screensharingd, and the first time that happens macOS asks the operator
-        # to let ScreensharingAgent "bypass the system private window picker and
-        # directly access the screen and audio". Measured 2026-09-10: it fires
-        # once per machine (it did not return after a reboot and a second
-        # pre-login connect), so asking here means it is answered during the
-        # install instead of ambushing whoever makes the first support call.
-        #
-        # This runs as ROOT on purpose -- it reads kvm/vnc.pw (root:wheel 0600).
-        # Unlike the meshagent grants it needs no responsible-process care: the
-        # process macOS judges is Apple's ScreensharingAgent, spawned by
-        # screensharingd from launchd, so it is its own responsible process no
-        # matter who opens the connection.
-        if /usr/sbin/netstat -an 2>/dev/null | grep -q '\.5900 .*LISTEN'; then
-            {
-                echo
-                echo "=== MeshAgent: Screen Sharing consent (Apple's own helper) ==="
-                echo "  Opening a brief local Screen Sharing session, so macOS asks for this"
-                echo "  now rather than on your first login-window connection."
-                echo "  Your screen may flicker for a couple of seconds."
-            } >/dev/tty
-            "$D/kvm/$EXE" -vncprobe >/dev/tty 2>&1
-            {
-                echo "  If macOS asked to allow direct access to the screen and audio, allow it."
-                printf "  Press Return to continue : "
-            } >/dev/tty
-            read -r _ </dev/tty || true
-        fi
+    # Which frontend will be used is the AGENT's decision, not ours.
+    #
+    # This gate used to require a usable /dev/tty and skip the whole walkthrough
+    # without one -- so running from a .pkg, which Installer.app runs with no
+    # controlling terminal, produced no prompts at all. The agent now falls back
+    # to native dialogs when it has no terminal (see perm_pick_frontend), and
+    # gating on a tty here prevented that from ever being reached.
+    #
+    # So the only real precondition is a CONSOLE USER to show dialogs to. A tty
+    # is still used when there is one, because the terminal flow is better in a
+    # terminal: it can print context above each question.
+    if : 2>/dev/null >/dev/tty; then MESH_TTY=1; else MESH_TTY=0; fi
 
-        FDAARG=""
-        [ "${MESH_NO_FDA:-0}" = "1" ] && FDAARG="nofda"
+    # Say something to the operator through whichever channel exists. Keep the
+    # text free of double quotes: it is interpolated into an AppleScript string.
+    mesh_tell() {
+        if [ "$MESH_TTY" = "1" ]; then
+            printf '%s\n' "$1" >/dev/tty
+        else
+            /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" /usr/bin/osascript -e \
+                "display dialog \"$1\" buttons {\"Continue\"} default button \"Continue\" with title \"MeshAgent setup\" with icon note giving up after 600" \
+                >/dev/null 2>&1 || true
+        fi
+    }
+
+    # Apple's OWN Screen Sharing helper needs consent too, separately from
+    # anything meshagent asks for. Login-window input is driven through
+    # screensharingd, and the first time that happens macOS asks the operator to
+    # let ScreensharingAgent "bypass the system private window picker and
+    # directly access the screen and audio". Measured 2026-09-10: it fires once
+    # per machine, so asking here means it is answered during the install instead
+    # of ambushing whoever makes the first support call.
+    #
+    # Runs as ROOT on purpose -- it reads kvm/vnc.pw (root:wheel 0600). Unlike
+    # the meshagent grants it needs no responsible-process care: the process
+    # macOS judges is Apple's ScreensharingAgent, spawned by screensharingd from
+    # launchd, so it is its own responsible process no matter who connects.
+    if /usr/sbin/netstat -an 2>/dev/null | grep -q '\.5900 .*LISTEN'; then
+        mesh_tell "Screen Sharing: macOS may now ask to allow direct access to the screen and audio. Approve it if asked. The screen may flicker for a moment."
+        if [ "$MESH_TTY" = "1" ]; then
+            "$D/kvm/$EXE" -vncprobe >/dev/tty 2>&1
+            printf "  Press Return to continue : " >/dev/tty
+            read -r _ </dev/tty || true
+        else
+            "$D/kvm/$EXE" -vncprobe >/dev/null 2>&1
+        fi
+    fi
+
+    FDAARG=""
+    [ "${MESH_NO_FDA:-0}" = "1" ] && FDAARG="nofda"
+    if [ "$MESH_TTY" = "1" ]; then
         /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" \
             "$D/kvm/$EXE" -requestperms $FDAARG </dev/tty >/dev/tty 2>&1 || \
             echo "  (permission walkthrough exited early -- grant them in System Settings)"
-        # Grants only take effect on a fresh process, so restart the agent.
-        /bin/launchctl bootout "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
-        sleep 1
-        /bin/launchctl bootstrap "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
     else
-        echo
-        echo "  Permission walkthrough SKIPPED: no usable terminal to ask on."
-        echo "  (Expected for MDM or any non-interactive run. Installing by hand from"
-        echo "   a Terminal, including 'curl ... | sudo bash', does prompt normally.)"
-        echo "  Grant Screen Recording and Accessibility in System Settings, or run"
-        echo "  this again from a Terminal to be walked through them."
+        echo "  No terminal: asking for permissions with dialogs instead."
+        /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" \
+            "$D/kvm/$EXE" -requestperms $FDAARG </dev/null 2>&1 || \
+            echo "  (permission walkthrough exited early -- grant them in System Settings)"
     fi
+    # Grants only take effect on a fresh process, so restart the agent.
+    /bin/launchctl bootout "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
+    sleep 1
+    /bin/launchctl bootstrap "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null
 fi
 
 # ---- post-install verification ------------------------------------------
