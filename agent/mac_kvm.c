@@ -1980,6 +1980,97 @@ static void perm_fake_kvm_session(void)
     close(fd);
 }
 
+
+// ---- asking without a terminal ---------------------------------------------
+//
+// A .pkg runs its scripts through Installer.app with no controlling terminal, so
+// none of the tty prompts above can pace anything there. They do not need to:
+// the permission DIALOGS are raised by the agent either way, and the terminal
+// was only ever used for "I have granted it, carry on". Native dialogs say that
+// just as well, and the checking logic underneath is unchanged.
+//
+// -requestperms refuses to run as root and the installer invokes it through
+// `launchctl asuser <uid> sudo -u <user>`, so osascript here lands in the
+// console user's own session and the dialogs appear on their screen.
+static int perm_use_gui = 0;
+
+// Show a dialog; return the index of the button pressed, or -1 if it could not
+// be shown or nobody answered. `buttons` is AppleScript list syntax, and `names`
+// must list the same labels in the same order.
+//
+// Bodies must contain no quotes or backslashes -- they are interpolated into an
+// AppleScript string inside a single-quoted shell argument. "giving up after"
+// matters: without it an unattended install would block here forever.
+static int perm_dialog(const char *body, const char *buttons, const char *defbtn,
+                       const char *const *names, int nnames)
+{
+    // Write the script to a FILE and run `osascript <file>` rather than passing
+    // it with -e through a shell.
+    //
+    // The first version interpolated the body into a single-quoted shell
+    // argument, and the bodies contain newlines: the newline ended the shell
+    // line and left the AppleScript string unterminated --
+    //     sh: -c: line 2: unexpected EOF while looking for matching '"'
+    // and no dialog ever appeared. Escaping for two nested languages at once is
+    // not worth it; a file removes the shell from the problem entirely, leaving
+    // only AppleScript string escaping, done explicitly below.
+    char path[] = "/tmp/meshagent-prompt.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    FILE *sf = fdopen(fd, "w");
+    if (sf == NULL) { close(fd); unlink(path); return -1; }
+
+    fputs("display dialog \"", sf);
+    for (const char *c = body; *c != 0; c++)
+    {
+        if      (*c == '\n') fputs("\\n",  sf);
+        else if (*c == '"')  fputs("\\\"", sf);
+        else if (*c == '\\') fputs("\\\\", sf);
+        else                 fputc(*c, sf);
+    }
+    fprintf(sf, "\" buttons {%s} default button \"%s\""
+                " with title \"MeshAgent setup\" with icon note"
+                " giving up after 600\n", buttons, defbtn);
+    fclose(sf);
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "/usr/bin/osascript %s 2>/dev/null", path);
+    FILE *f = popen(cmd, "r");
+    if (f == NULL) { unlink(path); return -1; }
+    char line[256];
+    line[0] = 0;
+    if (fgets(line, sizeof(line), f) == NULL) { pclose(f); unlink(path); return -1; }
+    pclose(f);
+    unlink(path);
+
+    char *b = strstr(line, "button returned:");
+    if (b == NULL) return -1;              // includes the "gave up" case
+    b += strlen("button returned:");
+    char *cut = strpbrk(b, ",\r\n");
+    if (cut != NULL) *cut = 0;
+    for (int i = 0; i < nnames; i++)
+        if (strcmp(b, names[i]) == 0) return i;
+    return -1;
+}
+
+// Information-only dialog.
+static void perm_say(const char *body)
+{
+    static const char *names[] = { "Continue" };
+    (void)perm_dialog(body, "\"Continue\"", "Continue", names, 1);
+}
+
+// Decide once, up front, how this run will ask: an inherited terminal, then
+// /dev/tty, then dialogs.
+static void perm_pick_frontend(void)
+{
+    perm_use_gui = 0;
+    if (isatty(STDIN_FILENO)) return;
+    FILE *t = fopen("/dev/tty", "r+");
+    if (t != NULL) { fclose(t); return; }
+    perm_use_gui = 1;
+}
+
 // IMPORTANT: this walkthrough must NOT test the permissions itself.
 //
 // TCC answers a status query for the RESPONSIBLE process, and this program runs
@@ -2094,6 +2185,27 @@ static int perm_wait(const char *label, int (*check)(void), const char *pane)
     for (;;)
     {
         if (check()) { printf("      -> %s granted\n", label); return 1; }
+
+        if (perm_use_gui)
+        {
+            // Same three choices as the terminal form, as buttons.
+            static const char *names[] = { "Skip", "Open System Settings", "Re-check" };
+            char body[640];
+            snprintf(body, sizeof(body),
+                "%s is not granted yet.\n\n"
+                "Approve it in the dialog macOS just showed, or open System Settings "
+                "to turn it on, then click Re-check.",
+                label);
+            int b = perm_dialog(body,
+                "\"Skip\",\"Open System Settings\",\"Re-check\"", "Re-check", names, 3);
+            if (b < 0)  { printf("      (could not ask -- skipping %s)\n", label); return 0; }
+            if (b == 0) { printf("      -> %s SKIPPED\n", label); return 0; }
+            if (b == 1) { perm_open_pane(pane); continue; }
+            perm_refresh_agent_status();
+            if (check()) { printf("      -> %s granted\n", label); return 1; }
+            continue;
+        }
+
         printf("      Grant it, then press Return here.\n");
         if (!perm_ask("      [Return]=recheck  o=open System Settings  s=skip : ", buf, sizeof(buf)))
         {
@@ -2113,9 +2225,19 @@ static int perm_wait(const char *label, int (*check)(void), const char *pane)
 // pushing/downloading files into protected locations on the managed Mac).
 void kvm_request_permissions_interactive(int wantFDA)
 {
+    perm_pick_frontend();
+
     printf("\n=== MeshAgent: granting macOS privacy permissions ===\n");
     printf("Two permissions are required, one is optional. Each step raises a dialog\n");
     printf("(or opens System Settings); grant it there, then come back here.\n\n");
+    if (perm_use_gui)
+    {
+        printf("  (no terminal -- asking with dialogs instead)\n");
+        perm_say("MeshAgent needs two macOS permissions to control this Mac remotely, "
+                 "and one optional one for file transfer.\n\n"
+                 "The next steps will show you Apple's own permission dialogs. "
+                 "Approve each one, then come back and click Re-check.");
+    }
 
     // [1] Accessibility -- remote keyboard/mouse in the logged-in session.
     // AXIsProcessTrustedWithOptions raises Apple's own dialog, whose "Open
@@ -2132,6 +2254,11 @@ void kvm_request_permissions_interactive(int wantFDA)
         // produced a SECOND dialog when the agent restarted and prompted for
         // itself. One prompt, correctly attributed, is better than two.
         printf("      restarting the agent so macOS raises its dialog...\n");
+        if (perm_use_gui)
+            perm_say("Step 1 of 3: Accessibility.\n\n"
+                     "Required for remote keyboard and mouse. When you click Continue, "
+                     "macOS will ask you to allow meshagent -- approve it, then click "
+                     "Re-check on the next dialog.");
         perm_kickstart_agent();
         perm_wait_for_agent(45);
         sleep(2);
@@ -2159,6 +2286,11 @@ void kvm_request_permissions_interactive(int wantFDA)
     if (perm_has_screencapture()) { printf("      -> already granted\n"); }
     else
     {
+        if (perm_use_gui)
+            perm_say("Step 2 of 3: Screen Recording.\n\n"
+                     "Required to see this Mac's screen. When you click Continue, macOS "
+                     "will ask you to allow meshagent -- approve it, then click Re-check "
+                     "on the next dialog.");
         printf("      opening a short local KVM session so macOS raises its dialog...\n");
         perm_fake_kvm_session();
         perm_wait("Screen Recording", perm_has_screencapture, "Privacy_ScreenCapture");
@@ -2176,8 +2308,24 @@ void kvm_request_permissions_interactive(int wantFDA)
         perm_daemon_path(dpath, sizeof(dpath));
         printf("      Needed only to push/download files into protected folders\n");
         printf("      (Desktop, Documents, Downloads, Mail, etc.) on this Mac.\n");
-        if (perm_ask("      Grant Full Disk Access now? [y/N]: ", ans, sizeof(ans))
-            && (ans[0] == 'y' || ans[0] == 'Y'))
+        int wantsFDA;
+        if (perm_use_gui)
+        {
+            static const char *n[] = { "Skip", "Grant" };
+            char body[640];
+            snprintf(body, sizeof(body),
+                "Optional: Full Disk Access.\n\n"
+                "Needed only to push or download files into protected folders "
+                "(Desktop, Documents, Downloads, Mail) on this Mac.\n\n"
+                "If you grant it, add this program in the list that opens:\n%s", dpath);
+            wantsFDA = (perm_dialog(body, "\"Skip\",\"Grant\"", "Grant", n, 2) == 1);
+        }
+        else
+        {
+            wantsFDA = (perm_ask("      Grant Full Disk Access now? [y/N]: ", ans, sizeof(ans))
+                        && (ans[0] == 'y' || ans[0] == 'Y'));
+        }
+        if (wantsFDA)
         {
             perm_open_pane("Privacy_AllFiles");
             printf("      In the list that just opened, click \"+\", press\n");
@@ -2186,7 +2334,11 @@ void kvm_request_permissions_interactive(int wantFDA)
             printf("      then make sure its switch is ON.\n");
             printf("      (This one cannot be checked from here -- the check would\n");
             printf("       report this Terminal's access, not the agent's.)\n");
-            perm_ask("      Press Return when done : ", ans, sizeof(ans));
+            if (perm_use_gui)
+                perm_say("Add the program to the Full Disk Access list, turn its switch on, "
+                         "then click Continue.\n\nThis one cannot be checked automatically.");
+            else
+                perm_ask("      Press Return when done : ", ans, sizeof(ans));
             printf("      -> Full Disk Access: left to you to confirm in the pane\n");
         }
         else { printf("      -> skipped (can be granted later in System Settings)\n"); }
@@ -2200,6 +2352,20 @@ void kvm_request_permissions_interactive(int wantFDA)
     // Not asserted either way: this process cannot see the agent's FDA state, and
     // probing from here reports the responsible process's access, not the agent's.
     printf("  Full Disk Access: optional -- confirm in System Settings if you use file transfer\n\n");
+    if (perm_use_gui)
+    {
+        char body[640];
+        snprintf(body, sizeof(body),
+            "MeshAgent setup finished.\n\n"
+            "Accessibility: %s\n"
+            "Screen Recording: %s\n"
+            "Full Disk Access: optional, not checked automatically\n\n"
+            "Anything not granted can be turned on later in System Settings, "
+            "Privacy and Security.",
+            perm_has_accessibility() ? "granted" : "NOT granted",
+            perm_has_screencapture() ? "granted" : "NOT granted");
+        perm_say(body);
+    }
 }
 
 // Are two files byte-identical? Used to decide whether a refresh is needed at

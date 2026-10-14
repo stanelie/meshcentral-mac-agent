@@ -1,0 +1,40 @@
+#!/bin/bash
+# MeshAgent installer package -- postinstall.
+#
+# This package carries NO payload on purpose. It fetches the hosted installer and
+# runs it, so there is exactly one source of truth for what an install does.
+#
+# It also keeps notarization simple: a package containing no Mach-O binaries has
+# nothing for Apple to object to, and -- more importantly -- the agent binaries
+# keep their existing signing identity. Re-signing them with a Developer ID
+# would change their designated requirement, which is what the Screen Recording
+# and Accessibility grants are pinned to, and every Mac in the fleet would have
+# to approve them again.
+set -u
+
+BASE_URL="https://__HOST__"
+LOG=/var/log/meshagent-pkg-install.log
+exec > >(/usr/bin/tee -a "$LOG") 2>&1
+echo "=== MeshAgent pkg install $(date) ==="
+
+TMP="$(/usr/bin/mktemp -d /tmp/meshagent-pkg.XXXXXX)"
+trap '/bin/rm -rf "$TMP"' EXIT
+
+if ! /usr/bin/curl -fsSL "$BASE_URL/install.sh" -o "$TMP/install.sh"; then
+    echo "ERROR: could not download $BASE_URL/install.sh"
+    # Tell the operator rather than failing silently behind Installer's progress bar.
+    CUSER="$(/usr/bin/stat -f %Su /dev/console)"
+    CUID="$(/usr/bin/id -u "$CUSER" 2>/dev/null)"
+    if [ -n "${CUID:-}" ] && [ "$CUSER" != "root" ]; then
+        /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" /usr/bin/osascript -e \
+          'display dialog "MeshAgent could not download the agent. Check this Mac'"'"'s network connection and run the installer again." buttons {"OK"} default button "OK" with title "MeshAgent setup" with icon stop' >/dev/null 2>&1
+    fi
+    exit 1
+fi
+
+# The installer detects that it has no terminal and asks with native dialogs
+# instead; nothing here needs to pass a flag for that.
+/bin/bash "$TMP/install.sh"
+RC=$?
+echo "=== installer exit $RC ==="
+exit $RC
