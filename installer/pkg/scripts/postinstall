@@ -64,7 +64,21 @@ if [ -n "${CUID:-}" ] && [ "${CUSER:-root}" != "root" ]; then
         SUPPORT="$HOMEDIR/Library/Application Support/MeshAgent"
         PLIST="$AGENTS/ca.exmachina.meshagent.firstrun.plist"
         RUNNER="$SUPPORT/firstrun.sh"
-        /bin/mkdir -p "$AGENTS" "$SUPPORT"
+        # Create these only if missing, and hand them to the USER.
+        #
+        # mkdir -p as root left them root-owned when they did not already exist,
+        # and then `ls ~/Library/LaunchAgents` failed with Permission denied for
+        # the user who owns the home directory. Worse, the one-shot runner
+        # deletes its own plist as the user at the end -- on a root-owned
+        # directory that rm fails silently and the job comes back at every
+        # single login, which is exactly what the self-deletion exists to stop.
+        for dir in "$AGENTS" "$SUPPORT"; do
+            if [ ! -d "$dir" ]; then
+                /bin/mkdir -p "$dir"
+                /usr/sbin/chown "$CUSER" "$dir"
+                /bin/chmod 755 "$dir"
+            fi
+        done
 
         /bin/cat > "$RUNNER" <<'RUNNEREOF'
 #!/bin/bash

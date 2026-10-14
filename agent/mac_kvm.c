@@ -2188,6 +2188,31 @@ static int perm_wait(const char *label, int (*check)(void), const char *pane)
 
         if (perm_use_gui)
         {
+            // Wait QUIETLY first. Apple's own prompt is on screen right now, and
+            // approving it can bring up an administrator password sheet of its
+            // own. Reported 2026-10-14: "the prompts appear all at once and
+            // leave the user no time to enter a password when asked before a
+            // popup appears on top of the prompt" -- that was this dialog going
+            // up over Apple's. Ours belongs BEFORE the system prompt (the step
+            // banner) or AFTER it has been dealt with, never on top of it.
+            //
+            // Accessibility reports itself without any help: the agent polls
+            // AXIsProcessTrusted every few seconds and re-execs when it turns
+            // true, which writes a fresh line to the log. Screen Recording needs
+            // a session to re-report, so refresh occasionally -- but rarely,
+            // since a refresh restarts the agent and can disturb a prompt the
+            // operator is still looking at.
+            {
+                int granted = 0;
+                for (int i = 0; i < 30 && !granted; i++)      // ~90 seconds
+                {
+                    sleep(3);
+                    if ((i % 10) == 9) perm_refresh_agent_status();   // ~every 30s
+                    granted = check();
+                }
+                if (granted) { printf("      -> %s granted\n", label); return 1; }
+            }
+
             // Same three choices as the terminal form, as buttons.
             static const char *names[] = { "Skip", "Open System Settings", "Re-check" };
             char body[640];
@@ -2232,11 +2257,9 @@ void kvm_request_permissions_interactive(int wantFDA)
     printf("(or opens System Settings); grant it there, then come back here.\n\n");
     if (perm_use_gui)
     {
+        // Deliberately no separate welcome dialog: each step already explains
+        // itself, and an extra dialog is one more thing stacked on screen.
         printf("  (no terminal -- asking with dialogs instead)\n");
-        perm_say("MeshAgent needs two macOS permissions to control this Mac remotely, "
-                 "and one optional one for file transfer.\n\n"
-                 "The next steps will show you Apple's own permission dialogs. "
-                 "Approve each one, then come back and click Re-check.");
     }
 
     // [1] Accessibility -- remote keyboard/mouse in the logged-in session.
@@ -2255,10 +2278,11 @@ void kvm_request_permissions_interactive(int wantFDA)
         // itself. One prompt, correctly attributed, is better than two.
         printf("      restarting the agent so macOS raises its dialog...\n");
         if (perm_use_gui)
-            perm_say("Step 1 of 3: Accessibility.\n\n"
-                     "Required for remote keyboard and mouse. When you click Continue, "
-                     "macOS will ask you to allow meshagent -- approve it, then click "
-                     "Re-check on the next dialog.");
+            perm_say("Step 1 of 3: Accessibility\n\n"
+                     "Needed for remote keyboard and mouse.\n\n"
+                     "After you click Continue, macOS will ask you to allow meshagent. "
+                     "Approve it -- and enter your password if it asks. Nothing else "
+                     "will appear until you are done.");
         perm_kickstart_agent();
         perm_wait_for_agent(45);
         sleep(2);
@@ -2287,10 +2311,11 @@ void kvm_request_permissions_interactive(int wantFDA)
     else
     {
         if (perm_use_gui)
-            perm_say("Step 2 of 3: Screen Recording.\n\n"
-                     "Required to see this Mac's screen. When you click Continue, macOS "
-                     "will ask you to allow meshagent -- approve it, then click Re-check "
-                     "on the next dialog.");
+            perm_say("Step 2 of 3: Screen Recording\n\n"
+                     "Needed to see this Mac's screen.\n\n"
+                     "After you click Continue, macOS will ask you to allow meshagent. "
+                     "Approve it -- and enter your password if it asks. Nothing else "
+                     "will appear until you are done.");
         printf("      opening a short local KVM session so macOS raises its dialog...\n");
         perm_fake_kvm_session();
         perm_wait("Screen Recording", perm_has_screencapture, "Privacy_ScreenCapture");
