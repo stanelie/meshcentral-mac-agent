@@ -4,12 +4,20 @@
 # This package carries NO payload on purpose. It fetches the hosted installer and
 # runs it, so there is exactly one source of truth for what an install does.
 #
-# It also keeps notarization simple: a package containing no Mach-O binaries has
-# nothing for Apple to object to, and -- more importantly -- the agent binaries
-# keep their existing signing identity. Re-signing them with a Developer ID
-# would change their designated requirement, which is what the Screen Recording
-# and Accessibility grants are pinned to, and every Mac in the fleet would have
-# to approve them again.
+# It also keeps notarization simple: a package with no Mach-O in it has nothing
+# for Apple to object to, and -- more importantly -- the agent binaries keep
+# their existing signing identity. Re-signing them with a Developer ID would
+# change their designated requirement, which is what the Screen Recording and
+# Accessibility grants are pinned to, and every Mac in the fleet would have to
+# approve them again.
+#
+# IMPORTANT: Installer.app must never be left waiting on a dialog. Measured
+# 2026-10-14: running the walkthrough inline left `installer` blocked on an
+# osascript prompt, and it exited while the dialog was still on screen -- the
+# install "finished" with the prompts orphaned and the log cut off mid-write. So
+# the install runs non-interactively here, and the permission walkthrough is
+# handed to launchd as a one-shot agent in the console user's session, which
+# outlives this script by design.
 set -u
 
 BASE_URL="https://__HOST__"
@@ -17,24 +25,81 @@ LOG=/var/log/meshagent-pkg-install.log
 exec > >(/usr/bin/tee -a "$LOG") 2>&1
 echo "=== MeshAgent pkg install $(date) ==="
 
+D="/usr/local/mesh_services/meshagent/meshagent"
 TMP="$(/usr/bin/mktemp -d /tmp/meshagent-pkg.XXXXXX)"
 trap '/bin/rm -rf "$TMP"' EXIT
 
+CUSER="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null)"
+CUID="$(/usr/bin/stat -f %u /dev/console 2>/dev/null)"
+
+tell_user() {   # best effort; no double quotes in the text
+    [ -n "${CUID:-}" ] && [ "${CUSER:-root}" != "root" ] || return 0
+    /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" /usr/bin/osascript -e \
+        "display dialog \"$1\" buttons {\"OK\"} default button \"OK\" with title \"MeshAgent setup\" with icon stop" \
+        >/dev/null 2>&1 || true
+}
+
 if ! /usr/bin/curl -fsSL "$BASE_URL/install.sh" -o "$TMP/install.sh"; then
     echo "ERROR: could not download $BASE_URL/install.sh"
-    # Tell the operator rather than failing silently behind Installer's progress bar.
-    CUSER="$(/usr/bin/stat -f %Su /dev/console)"
-    CUID="$(/usr/bin/id -u "$CUSER" 2>/dev/null)"
-    if [ -n "${CUID:-}" ] && [ "$CUSER" != "root" ]; then
-        /bin/launchctl asuser "$CUID" /usr/bin/sudo -u "$CUSER" /usr/bin/osascript -e \
-          'display dialog "MeshAgent could not download the agent. Check this Mac'"'"'s network connection and run the installer again." buttons {"OK"} default button "OK" with title "MeshAgent setup" with icon stop' >/dev/null 2>&1
-    fi
+    tell_user "MeshAgent could not download the agent. Check this Mac network connection and run the installer again."
     exit 1
 fi
 
-# The installer detects that it has no terminal and asks with native dialogs
-# instead; nothing here needs to pass a flag for that.
-/bin/bash "$TMP/install.sh"
+# Non-interactive: the walkthrough is scheduled separately, below.
+MESH_SKIP_PERMS=1 /bin/bash "$TMP/install.sh"
 RC=$?
 echo "=== installer exit $RC ==="
-exit $RC
+[ "$RC" -eq 0 ] || { tell_user "MeshAgent installation failed. See /var/log/meshagent-pkg-install.log for details."; exit "$RC"; }
+
+# Apple's own Screen Sharing helper consent. Runs as root (it reads kvm/vnc.pw,
+# root:wheel 0600), returns in a few seconds, and does not wait on us.
+[ -x "$D/kvm/meshagent" ] && "$D/kvm/meshagent" -vncprobe >/dev/null 2>&1 || true
+
+# Hand the permission walkthrough to launchd, as the console user, as a one-shot
+# job that deletes itself afterwards so it cannot run again at every login.
+if [ -n "${CUID:-}" ] && [ "${CUSER:-root}" != "root" ]; then
+    HOMEDIR="$(/usr/bin/dscl . -read "/Users/$CUSER" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')"
+    if [ -n "$HOMEDIR" ] && [ -d "$HOMEDIR" ]; then
+        AGENTS="$HOMEDIR/Library/LaunchAgents"
+        SUPPORT="$HOMEDIR/Library/Application Support/MeshAgent"
+        PLIST="$AGENTS/ca.exmachina.meshagent.firstrun.plist"
+        RUNNER="$SUPPORT/firstrun.sh"
+        /bin/mkdir -p "$AGENTS" "$SUPPORT"
+
+        /bin/cat > "$RUNNER" <<'RUNNEREOF'
+#!/bin/bash
+# One-shot: ask for the privacy permissions, then remove itself.
+/usr/local/mesh_services/meshagent/meshagent/kvm/meshagent -requestperms
+P="$HOME/Library/LaunchAgents/ca.exmachina.meshagent.firstrun.plist"
+# Delete BEFORE booting out: bootout terminates this script, so anything after
+# it would not run and the job would come back at the next login.
+/bin/rm -f "$P" "$0"
+/bin/launchctl bootout "gui/$(/usr/bin/id -u)/ca.exmachina.meshagent.firstrun" 2>/dev/null
+RUNNEREOF
+
+        /bin/cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>ca.exmachina.meshagent.firstrun</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$RUNNER</string></array>
+<key>LimitLoadToSessionType</key><array><string>Aqua</string></array>
+<key>RunAtLoad</key><true/>
+<key>StandardOutPath</key><string>/tmp/meshagent-firstrun.log</string>
+<key>StandardErrorPath</key><string>/tmp/meshagent-firstrun.log</string>
+</dict></plist>
+PLISTEOF
+
+        /usr/sbin/chown "$CUSER" "$RUNNER" "$PLIST"
+        /bin/chmod 755 "$RUNNER"
+        /bin/chmod 644 "$PLIST"
+        /bin/launchctl bootout "gui/$CUID/ca.exmachina.meshagent.firstrun" 2>/dev/null
+        if /bin/launchctl bootstrap "gui/$CUID" "$PLIST" 2>/dev/null; then
+            echo "permission walkthrough scheduled for $CUSER (one-shot launchd job)"
+        else
+            echo "WARNING: could not schedule the permission walkthrough"
+            tell_user "MeshAgent is installed, but the permission prompts could not be started. Open Terminal and run: sudo bash -c 'curl -fsSL $BASE_URL/install.sh -o /tmp/i.sh; bash /tmp/i.sh'"
+        fi
+    fi
+fi
+exit 0
