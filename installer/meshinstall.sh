@@ -341,8 +341,27 @@ esac
 
 # ---- start daemon + dual-session agent (+ TCC watcher) ----
 /bin/launchctl load "/Library/LaunchDaemons/$SV.plist" 2>/dev/null
-CUID=$(stat -f%u /dev/console 2>/dev/null || echo "")
-CUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "")
+# Who is the console user?
+#
+# NOT from /dev/console ownership. That is what this used to do, and it is
+# unreliable: measured on a VM with user1 logged in and active,
+#     stat -f %Su /dev/console  ->  root
+#     scutil State:/Users/ConsoleUser Name  ->  user1
+# With CUSER=root every block below is skipped in silence -- the permission
+# walkthrough, the TCC watcher, and the per-user LaunchAgent bootstrap -- and the
+# install still reports success. That is almost certainly behind more than one
+# "the installer did nothing" report.
+#
+# SCDynamicStore is the authority (it is what the agent itself uses). Fall back
+# to /dev/console only if that yields nothing, and treat root or loginwindow as
+# "nobody is logged in".
+CUSER=$(echo "show State:/Users/ConsoleUser" | /usr/sbin/scutil 2>/dev/null | /usr/bin/awk '/Name :/ { print $3 }')
+case "$CUSER" in loginwindow|root|"") CUSER="" ;; esac
+if [ -z "$CUSER" ]; then
+    CUSER=$(stat -f%Su /dev/console 2>/dev/null || echo "")
+    case "$CUSER" in root|"") CUSER="" ;; esac
+fi
+if [ -n "$CUSER" ]; then CUID=$(id -u "$CUSER" 2>/dev/null || echo ""); else CUID=""; fi
 if [ -n "$CUID" ] && [ "$CUSER" != "root" ] && [ -n "$CUSER" ]; then
     /bin/launchctl bootstrap "gui/$CUID" "/Library/LaunchAgents/$SV.plist" 2>/dev/null || \
     /bin/launchctl load "/Library/LaunchAgents/$SV.plist" 2>/dev/null
