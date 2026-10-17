@@ -1,8 +1,13 @@
 #!/bin/bash
 # Build (and optionally sign + notarize) the MeshAgent installer package.
 #
-#   ./build-pkg.sh mc.example.com                 -> unsigned, for testing
+#   ./build-pkg.sh mc.example.com                 -> unsigned
 #   ./build-pkg.sh mc.example.com "Developer ID Installer: Name (TEAMID)" meshnotary
+#
+# Signing is usually NOT done here. Use sign-pkg.sh on the machine that holds the
+# Developer ID private key -- it takes the finished package and needs neither this
+# repo nor a rebuild, so the key never has to be copied to a build machine. The
+# signing arguments below exist for the case where both happen on one Mac.
 #
 # The package has NO payload: its postinstall fetches https://<host>/install.sh
 # and runs it. That keeps one source of truth for the install, and it keeps the
